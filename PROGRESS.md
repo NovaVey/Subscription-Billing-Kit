@@ -222,3 +222,15 @@ PR #1 (Phases 0-4) merged into `main` with no CI gate at all - this repo had no 
 Verified the exact command sequence locally first (against this sandbox's local Postgres 16 instance, with the same env var values CI will use) before pushing: typecheck clean, lint clean, build clean, migrations apply cleanly, 40/40 unit tests and 26/26 integration tests pass.
 
 **Open item:** branch protection / rulesets on `main` (require PR, require this new CI check, block force-push) still need to be configured in the GitHub UI - no tool in this session's GitHub MCP server can create repository rulesets, so that step is manual.
+
+## Infrastructure: run migrations on boot (between Phase 4 and Phase 5)
+
+Discovered that Railway has a service (in the "Upwork Portfolio" project) auto-deploying this repo's `main` branch on every push - separately from this build's own phase-by-phase Railway/Postgres provisioning back in Phase 0. Two problems surfaced from its build logs:
+1. `STRIPE_SECRET_KEY` / `STRIPE_API_VERSION` were only ever set in this sandbox's local, gitignored `.env` - never configured as real Railway environment variables. Fixed by setting both directly on the Railway service via the Railway MCP connector, using the same real pinned values used throughout this build.
+2. Once the app booted, the webhook processor/reaper ticks failed continuously - the real Railway Postgres has never had `npm run db:migrate` run against it (every migration so far, every phase, ran only against this sandbox's local throwaway `billing_kit_test` - see Phase 1's entry on why: this sandbox cannot reach the real Railway Postgres over raw TCP at all, re-confirmed here). Fixed at the source rather than as a one-off: changed `api/package.json`'s `start` script from `node dist/index.js` to `node dist/db/migrate.js && node dist/index.js`, so every deploy applies any pending migrations before serving traffic. Drizzle's migrator tracks its own applied-migrations table, so this is idempotent - a no-op on deploys with nothing new to apply.
+
+Verified locally: ran the exact new start sequence (`node dist/db/migrate.js && node dist/index.js`) against this sandbox's local Postgres - migration step reports `migrations applied` and the server then boots and listens normally. Confirmed on Railway itself after pushing: the previously-failing deployment now builds, migrates, and boots with the processor/reaper ticking cleanly.
+
+**Open items carried forward:**
+1. `STRIPE_WEBHOOK_SECRET` is still not set on Railway - the local sandbox's value was generated for local `stripe listen` testing and is **not** the deployed endpoint's real signing secret (per the runbook note in the phase 9 spec: these are always different values). Creating the real webhook endpoint against this Railway deployment's public URL requires either a real Stripe Dashboard session or API access this sandbox doesn't have - unchanged blocker, carried forward.
+2. No public domain is provisioned for this Railway service yet (`railway_list_domains` returned none) - needed before Checkout/portal return URLs or a real webhook endpoint can point at it.
