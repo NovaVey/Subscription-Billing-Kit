@@ -6,7 +6,7 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 
 **Date:** 2026-07-27
 
-**Status:** Code complete, pending CHECKPOINT confirmation before Phase 1.
+**Status:** Code complete and committed (`da0a15e`). Checkpoint resolved — see "Checkpoint resolution" below. Ready for Phase 1.
 
 **Files touched:**
 - `package.json` (root, npm workspaces — `api` only for now, `web` joins in Phase 7)
@@ -40,8 +40,13 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 - Health check for Stripe connectivity uses `stripe.accounts.retrieveCurrent()` (added in newer SDK majors) rather than the old zero-arg `accounts.retrieve()`, which now requires an explicit id argument.
 - Verified locally: missing/invalid `.env` crashes boot with a listed, human-readable error (not a raw stack trace); with schema-valid-but-unreachable dummy credentials, the process boots cleanly and `GET /health` returns `503` with `{status: "degraded", db: {ok:false,...}, stripe: {ok:false,...}, apiVersion}` — i.e. bad *config* fails loudly at boot, bad *connectivity* is a runtime health status, not a crash.
 
-**Open questions (blocking Phase 1 — see checkpoint message):**
-1. Railway Postgres — an "Upwork Portfolio" project with a `Subscription-Billing-Kit` service already exists (pre-provisioned), but no Postgres database is attached to it yet. Needs a decision: provision one now (dev + a separate demo DB per §2), or is there an existing `DATABASE_URL` to use?
-2. Stripe API version to pin — connected Stripe account is a sandbox ("Nova Vey sandbox", `acct_1TkxuuLVBwTnHcyi`). The account's API version isn't exposed over the API (only in Workbench), so this needs to come from you.
-3. `STRIPE_SECRET_KEY` (test mode) — not something to paste into a committed file or chat log carelessly; need a decision on how it's supplied (direct to Railway env vars vs. a `.env` I set locally in this session).
-4. Stripe CLI isn't installed in this container — fine for Phase 0, will need it (or an equivalent) from Phase 2 onward for `stripe listen` / `stripe trigger`.
+**Checkpoint resolution (2026-07-27, same day):**
+1. **Railway Postgres** — provisioned via `templateDeployV2` using Railway's own verified `postgres` template (`ghcr.io/railwayapp-templates/postgres-ssl:18`, not a bare Docker image), in the existing "Upwork Portfolio" project. Deployed with a persistent volume (`RAILWAY_VOLUME_ID` present, mounted at `/var/lib/postgresql/data`) and an auto-generated password. Service id `634536e4-20f6-4933-9651-66bc02f26e80`. The pre-existing `Subscription-Billing-Kit` app service's `DATABASE_URL` variable was set to `${{Postgres.DATABASE_URL}}` (Railway variable reference, private network URL) for when it deploys in Phase 9. This is the **dev** database; a separate **demo** database is still needed before Phase 9's deploy per §2.
+2. **Stripe API version** — pinned to `2026-06-24.dahlia`, current per Stripe's own docs at the time of this session. Set in local `.env`.
+3. **`STRIPE_SECRET_KEY`** — a restricted key (`rk_test_...`) was created in the Dashboard, scoped to least-privilege (Customers, Subscriptions, Products, Prices, Checkout Sessions, Customer Portal, Invoices, PaymentIntents: write; Events, Balance, Account: read; everything else none) rather than a full secret key — Stripe's own guidance specifically recommends restricted keys "when giving a key to an AI agent." Pasted by the user directly into this session and written only to the gitignored local `.env`, never committed or logged elsewhere.
+4. **Stripe CLI** — still not installed in this container; still a Phase 2 dependency, unresolved for now.
+
+**Sandbox network limitation discovered (important for future sessions):** this session's execution environment cannot reach the public internet except through an HTTPS-only, allow-listed proxy. Two consequences hit during this checkpoint:
+- Direct calls to `api.stripe.com` from this sandbox (via `curl` or the app's own Stripe SDK call) fail with `403 CONNECT tunnel failed` — the host isn't on the egress allowlist. The Stripe MCP connector (separate credentials, runs outside this restriction) still works fine and was used for research (docs, account info). The app's own Stripe connectivity has *not* been live-verified from this container — it will be the first time the app runs somewhere with real egress (the user's machine, or deployed).
+- Raw TCP to the new Postgres's public proxy (`sakura.proxy.rlwy.net:14822`) isn't proxied at all — the connection doesn't get refused, it hangs. This surfaced a real bug independent of the sandbox: `api/src/db/client.ts`'s `pg.Pool` had no `connectionTimeoutMillis`, so `checkDbConnectivity()` (and therefore `/health`) hung for **134 seconds** before the OS-level TCP timeout finally fired. Fixed by setting `connectionTimeoutMillis: 5_000` — verified the same unreachable-DB case now fails in ~5s instead. This fix matters in production too, not just here: an unreachable DB should make `/health` fail fast, not hang callers (load balancers, uptime checks) for minutes.
+- Net effect: DB and Stripe connectivity are implemented and structurally verified (dummy credentials correctly produce `503` + per-service error, fast now for DB), but **not yet live-verified end-to-end** from any environment with real network access. That's the first thing to confirm at the start of Phase 1/2 work, ideally by running `npm run dev` and hitting `/health` from the user's own machine or CI.
