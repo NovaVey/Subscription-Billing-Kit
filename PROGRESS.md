@@ -214,3 +214,11 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 2. Stripe CLI still not installed/available - needed for Phase 5's test clocks especially.
 3. A separate demo Postgres database is still needed before Phase 9.
 4. `GET /subscriptions` (list, with filters) and `GET /invoices` from §6's API surface weren't built this phase - deferred to whenever Phase 7's admin UI actually needs them, since they weren't part of Phase 4's stated scope and adding them speculatively wasn't warranted.
+
+## Infrastructure: CI workflow (between Phase 4 and Phase 5)
+
+PR #1 (Phases 0-4) merged into `main` with no CI gate at all - this repo had no `.github/workflows` directory yet, so "merge when green" had nothing to check against. Added `.github/workflows/ci.yml`: on every PR and push to `main`, runs `typecheck` → `lint` → `build` → `db:migrate` → `test:unit` → `test:integration` against a fresh `postgres:16` service container, on Node 20. The Stripe secret/webhook-secret env vars are placeholder strings that only need to satisfy `envSchema.ts`'s shape validation (`sk_test_...` / `whsec_...` prefixes) - every Stripe call in the suite is mocked, so CI never needs real credentials or network access to `api.stripe.com`, matching this sandbox's own constraint.
+
+Verified the exact command sequence locally first (against this sandbox's local Postgres 16 instance, with the same env var values CI will use) before pushing: typecheck clean, lint clean, build clean, migrations apply cleanly, 40/40 unit tests and 26/26 integration tests pass.
+
+**Open item:** branch protection / rulesets on `main` (require PR, require this new CI check, block force-push) still need to be configured in the GitHub UI - no tool in this session's GitHub MCP server can create repository rulesets, so that step is manual.
