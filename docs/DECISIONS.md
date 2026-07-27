@@ -133,3 +133,17 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** No listener — the pattern most `pg.Pool` examples (including Stripe/Node tutorials in general) show by default.
 **Why it lost:** Discovered live while demonstrating Phase 2's "DB down → 500" checkpoint by actually stopping Postgres mid-request: without this listener, the idle client's connection-terminated error was an *unhandled* `EventEmitter` `'error'` event, which Node treats as fatal — it crashed the entire process, taking down every in-flight request, not just the one that happened to be querying. A routine database restart shouldn't be able to take the whole service offline.
 **Revisit if:** Never — this listener costs nothing and the failure mode it prevents is total.
+
+## D-017 — The staleness guard compares timestamps, it doesn't re-derive correctness from re-fetching
+**Date:** 2026-07-27 · **Phase:** 3 · **Status:** settled
+**Decision:** `handlers/subscription.ts` and `handlers/invoice.ts` compare `event.created` against the row's `last_event_at` *before* re-fetching, and skip entirely (no re-fetch, no write) if the event is older.
+**Alternative rejected:** Always re-fetch and let the API's current-truth response naturally overwrite whatever an older event would have shown — skip the timestamp check as redundant, since a re-fetch never returns stale data.
+**Why it lost:** Re-fetching does always return current truth, so the data itself is never actually wrong — but *applying an older event's semantics after a newer one* would still write a misleading `subscription_events` row (e.g. a `-> trialing` transition appearing chronologically after an already-recorded `-> canceled` one) and could re-run side effects tied to that specific event type. The guard protects the audit trail and event-specific logic, not the projected data.
+**Revisit if:** Never — this is a correctness property, not a performance optimization that could be safely dropped.
+
+## D-018 — Invoice's subscription reference and PaymentIntent's invoice reference, verified against the SDK's types instead of assumed
+**Date:** 2026-07-27 · **Phase:** 3 · **Status:** settled
+**Decision:** `handlers/invoice.ts` reads `invoice.parent.subscription_details.subscription` (not `invoice.subscription`); `handlers/paymentIntent.ts` resolves the linked invoice via `stripe.invoicePayments.list({ payment: { type: 'payment_intent', payment_intent: id } })` (not `paymentIntent.invoice`).
+**Alternative rejected:** Read `invoice.subscription` and `paymentIntent.invoice` directly — the shape assumed by most existing tutorials, blog posts, and this pinned version's predecessors.
+**Why it lost:** Checked against the installed Stripe SDK's own type definitions (generated from Stripe's OpenAPI spec for this exact pinned version) rather than recalled from memory or copied from older material: neither field exists on either object in this API version. Both are the Basil period-fields bug's exact shape — a plausible field silently absent, no error, no exception — just discovered on two different objects instead of one.
+**Revisit if:** Never, unless a future API version restructures these again — in which case the fix is the same discipline that caught it here: check the pinned version's actual types before writing the handler.

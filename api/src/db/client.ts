@@ -23,6 +23,11 @@ pool.on('error', (err) => {
 
 export const db = drizzle(pool, { schema });
 
+// Accepts either the top-level db or a transaction handle from
+// db.transaction(async (tx) => ...) — derived from db's own type so it
+// always matches the actual generic instantiation, rather than guessing it.
+export type Executor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 export interface DbConnectivity {
   ok: boolean;
   error?: string;

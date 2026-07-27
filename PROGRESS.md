@@ -135,3 +135,43 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 1. Still true from Phase 1: live end-to-end verification against the real Railway Postgres and real Stripe API needs an environment with normal internet access.
 2. Stripe CLI still not installed/available anywhere in this project's reach — needed from here on for `stripe listen`/`stripe trigger`, and for Phase 5's test clocks.
 3. A separate demo Postgres database is still needed before Phase 9.
+
+## Phase 3 — Processor, reaper, state machine
+
+**Date:** 2026-07-27
+
+**Status:** Code complete, all exit criteria verified via a mocked-Stripe-client integration suite (no explicit CHECKPOINT for this phase per the build spec). Committed.
+
+**Files touched:**
+- `api/src/billing/stateMachine.ts` — the 8-status transition table, `isExpectedTransition()`, `recordTransition()` (writes `subscription_events`)
+- `api/src/webhooks/handlers/customer.ts`, `subscription.ts`, `invoice.ts`, `paymentIntent.ts`
+- `api/src/webhooks/processor.ts` — `FOR UPDATE SKIP LOCKED` claim, dispatch, exponential backoff, park-at-5
+- `api/src/webhooks/reaper.ts` — reclaims stale `processing` rows
+- `api/src/webhooks/worker.ts` — in-process interval loops (processor every 2s, reaper every 30s), wired into `index.ts`
+- `api/src/db/client.ts` — added `Executor` type (shared between `db` and `db.transaction()`'s `tx`)
+- `api/test/unit/stateMachine.test.ts`
+- `api/test/integration/helpers/stripeFixtures.ts`, `subscriptionProjection.test.ts`, `reaperRecovery.test.ts`, `handlersBasic.test.ts`
+- `api/vitest.integration.config.ts` — added `fileParallelism: false` (see below)
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (D-017, D-018)
+
+**Decisions made:**
+- The processor's claim step (`SELECT ... FOR UPDATE SKIP LOCKED` + flip to `processing`) is a short transaction; the actual handler work — including the Stripe API re-fetch — happens *after* it commits, never inside it. Holding a transaction open across a network call would hold row locks far longer than necessary and defeat the point of `SKIP LOCKED`.
+- No separate worker process/service — the processor and reaper run as `setInterval` loops in the same Node process as the HTTP server (`.unref()`'d so they don't keep the process alive on their own). Matches D-005's "Postgres as the queue, not a second infrastructure dependency."
+- The staleness guard (§5.7) is about protecting the *audit trail and event-specific side effects*, not the projected data — re-fetching always returns current truth regardless of processing order. See D-017 and the ARCHITECTURE.md section for the full reasoning; this took a real pass of thinking through *why* the guard is needed before implementing it, since the naive "re-fetch fixes ordering" argument doesn't fully hold.
+- `customer.deleted` and a draft `invoice.deleted` (re-fetch 404s) are handled explicitly rather than falling through: a deleted Stripe customer's local row is kept as historical record (no schema column exists to mark it, and FK-referenced billing history shouldn't disappear); a deleted draft invoice's local row (if any) is removed, since it never represented a real, collectible invoice.
+- `vitest.integration.config.ts` gained `fileParallelism: false`. Found this was necessary while writing the reaper test: vitest runs test *files* in parallel by default, and the reaper's query (`status='processing' AND processing_started_at < cutoff`) matches rows from *any* test file sharing the same physical database — a genuine cross-test contamination risk, not a hypothetical one. Sequential execution costs wall-clock time, which §9 explicitly says integration tests don't need to economize on.
+
+**Two more Basil-shaped findings (§0 rule 9 doing its job again):** verifying every field against the installed Stripe SDK's own type definitions (not memory, not older tutorials) surfaced that `invoice.subscription` doesn't exist in this API version — it's `invoice.parent.subscription_details.subscription` — and that `PaymentIntent` has no `.invoice` field at all anymore (resolved instead via `stripe.invoicePayments.list(...)`). Both are documented in `docs/ARCHITECTURE.md` and as D-018. Same failure shape as the period-fields change this whole project is built around, just caught during implementation instead of in a production incident.
+
+**How the exit criteria were verified:** this sandbox still can't reach `api.stripe.com` (Phase 0's finding, unchanged) and still has no Stripe CLI, so `stripe trigger`-driven verification wasn't possible here. Verified instead with an integration suite that mocks only the Stripe SDK calls (`vi.mock` on `src/stripe/client.js`, replacing `.retrieve()`/`.list()` with fixtures built from the *verified* real API shapes) while using the real local Postgres for every DB read/write and the real, unmocked processor/reaper/handler code — the only thing not real is the network hop to Stripe itself:
+- `subscription-periods-are-read-from-items-not-from-the-subscription` and `a-mixed-interval-subscription-stores-a-period-per-item` — a two-item subscription (monthly + annual, different period ends) projects both items with independently correct periods, and `next_period_end_derived` picks the sooner one.
+- `subscription-created-then-immediately-canceled-out-of-order` and `an-event-that-arrives-late-does-not-overwrite-newer-state` — events fed out of order; the older one is skipped (`webhook_events.status='skipped'`), the newer state survives, and the stale event's handler never even calls the Stripe API a second time (asserted via mock call count).
+- `a-worker-killed-mid-event-has-its-row-reaped-and-reprocessed` — a row manually set to `processing` with a `processing_started_at` older than `WEBHOOK_LEASE_SECONDS` is returned to `received` by the reaper and then successfully processed on the next tick; a second case confirms a row that would exceed `MAX_ATTEMPTS` is parked `failed` instead of re-queued.
+- `every-state-machine-transition-is-covered` — unit-tested directly against the transition table (all 64 (from, to) combinations resolve to a defined boolean; terminal states, backward jumps, and the null/no-op cases are asserted explicitly).
+- The customer, invoice (including the `parent.subscription_details` resolution and the one-off/no-subscription case), and payment-intent (including the "no linked invoice" case) handlers are each exercised directly in `handlersBasic.test.ts`.
+- 17/17 integration tests passing, 32/32 unit tests passing, clean typecheck/lint/build throughout.
+
+**Open items carried forward (unchanged from Phase 2, still true):**
+1. Live end-to-end verification against the real Railway Postgres and real Stripe API still needs an environment with normal internet access — nothing in Phase 3 changed this; everything here was verified against the local Postgres with a mocked Stripe client.
+2. Stripe CLI still not installed/available — needed for Phase 5's test clocks especially.
+3. A separate demo Postgres database is still needed before Phase 9.
