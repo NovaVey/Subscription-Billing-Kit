@@ -1,0 +1,24 @@
+{
+  "name": "subscription-billing-kit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Stripe subscription billing that survives production.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "api"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=api",
+    "build": "npm run build --workspace=api",
+    "start": "npm run start --workspace=api",
+    "lint": "npm run lint --workspace=api",
+    "typecheck": "npm run typecheck --workspace=api",
+    "test:unit": "npm run test:unit --workspace=api",
+    "test:integration": "npm run test:integration --workspace=api",
+    "db:generate": "npm run db:generate --workspace=api",
+    "db:migrate": "npm run db:migrate --workspace=api"
+  }
+}
