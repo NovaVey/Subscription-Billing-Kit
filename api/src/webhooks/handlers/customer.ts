@@ -1,7 +1,6 @@
 import type Stripe from 'stripe';
 import { stripe } from '../../stripe/client.js';
-import { db } from '../../db/client.js';
-import { customers } from '../../db/schema.js';
+import { syncCustomerFromStripe } from '../../stripe/sync.js';
 import { logger } from '../../lib/logger.js';
 
 export interface HandlerResult {
@@ -36,31 +35,7 @@ export async function handleCustomerEvent(event: Stripe.Event): Promise<HandlerR
     logger.warn({ customerId }, 'Stripe customer has no email; storing an empty string');
   }
 
-  const externalRef = typeof customer.metadata?.['external_ref'] === 'string'
-    ? customer.metadata['external_ref']
-    : undefined;
-
-  await db
-    .insert(customers)
-    .values({
-      stripeCustomerId: customer.id,
-      email: customer.email ?? '',
-      name: customer.name ?? null,
-      delinquent: customer.delinquent ?? false,
-      ...(externalRef !== undefined ? { externalRef } : {}),
-    })
-    .onConflictDoUpdate({
-      target: customers.stripeCustomerId,
-      set: {
-        email: customer.email ?? '',
-        name: customer.name ?? null,
-        delinquent: customer.delinquent ?? false,
-        updatedAt: new Date(),
-        // Only touch external_ref when Stripe metadata actually carries one
-        // - never overwrite an existing value with a blank on a bare re-sync.
-        ...(externalRef !== undefined ? { externalRef } : {}),
-      },
-    });
+  await syncCustomerFromStripe(customer);
 
   return {};
 }

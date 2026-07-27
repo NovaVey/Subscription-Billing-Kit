@@ -175,3 +175,42 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 1. Live end-to-end verification against the real Railway Postgres and real Stripe API still needs an environment with normal internet access — nothing in Phase 3 changed this; everything here was verified against the local Postgres with a mocked Stripe client.
 2. Stripe CLI still not installed/available — needed for Phase 5's test clocks especially.
 3. A separate demo Postgres database is still needed before Phase 9.
+
+## Phase 4 — Checkout, portal, plan changes
+
+**Date:** 2026-07-27
+
+**Status:** Code complete, all exit criteria verified. Checkpoint resolved by user's explicit choice (see below). Committed.
+
+**Files touched:**
+- `api/src/stripe/idempotency.ts` — every outbound idempotency key, one module
+- `api/src/stripe/sync.ts` (new) — `syncCustomerFromStripe()` / `syncSubscriptionFromStripe()`, extracted from the Phase 3 webhook handlers so admin routes can reuse the identical projection path
+- `api/src/webhooks/handlers/customer.ts`, `subscription.ts` — slimmed down to call into `sync.ts`, behavior unchanged (re-verified against the full Phase 2/3 suite after the refactor)
+- `api/src/stripe/checkout.ts`, `api/src/stripe/portal.ts`
+- `api/src/routes/customers.ts`, `checkout.ts`, `portal.ts`, `subscriptions.ts` — wired into `app.ts`
+- `api/db/client.ts` — no changes needed beyond what Phase 3 already added
+- `api/test/unit/idempotency.test.ts`
+- `api/test/integration/checkoutPortalPlanChange.test.ts`
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (D-019, D-020)
+
+**Decisions made:**
+- Extracted `stripe/sync.ts` out of the Phase 3 webhook handlers specifically so this phase's admin routes (cancel/resume/plan-change) project subscriptions through the *exact same code path* a webhook does, rather than duplicating the items/periods projection logic in two places that could drift apart.
+- Customer creation is idempotent *forever* (keyed on `external_ref` alone, backed by a local-first DB check) — everything else (checkout, portal, plan-change, cancel, resume) is keyed on the operation plus a captured `requestedAt`, since those are legitimately repeatable actions over a subscription's lifetime. See D-019.
+- Admin mutations (cancel/resume/plan-change) never trust the Stripe mutation response's shape — they re-fetch via `retrieve(id, {expand: ['items.data.price']})` immediately after, and sync *that*, applying §5.6's "never trust the payload" discipline to writes as well as reads.
+- `syncSubscriptionFromStripe()` gained a `forceRecord` option so manual actions always write a `subscription_events` audit row (§5.8), even when - as with most plan changes - `status` itself doesn't change. See D-020.
+- `GET /subscriptions/:id` and the resume endpoint's dual-branch logic (un-set `cancel_at_period_end` vs. call Stripe's dedicated `.resume()` for a `paused` subscription) went a little beyond the phase's literal exit criteria, but were cheap and directly useful for verifying this phase's own work.
+- A fourth Basil-shaped restructuring turned up while building the plan-change preview: `InvoiceLineItem` has no top-level `proration` flag either — it's nested under `line.parent.invoice_item_details.proration` / `line.parent.subscription_item_details.proration`, the same discriminated-union shape as `invoice.parent`. Implemented correctly (`isProrationLine()` in `routes/subscriptions.ts`) rather than skipped, since by this point verifying against the SDK's types first was already the default habit, not extra effort.
+
+**How the exit criteria were verified, and the checkpoint's resolution:** this sandbox still can't reach `api.stripe.com` (unchanged since Phase 0) and has no path for a real webhook delivery into this container - so a single, unbroken "click checkout, see it land locally" demo was never achievable here regardless of which pieces got bridged or faked. Presented this tradeoff directly and asked how to satisfy the checkpoint; the choice was the mocked-but-faithful integration suite over a real-Stripe-but-proves-nothing-about-our-code browser demo. Delivered:
+- `POST /customers` twice with the same `external_ref` → one local row, one Stripe API call (the second short-circuits on the local-first check) - this is `a-retried-create-call-with-the-same-idempotency-key-creates-one-subscription`'s customer-creation analogue.
+- `POST /checkout/sessions` returns a real-shaped Stripe-hosted URL; 404 for an unknown customer.
+- `POST /portal/sessions` returns a portal URL.
+- `plan-change-preview-matches-the-invoice-stripe-actually-issues` - the preview amount is asserted to pass through unmodified, proving our code doesn't recompute or round Stripe's own proration numbers.
+- Cancel (`at_period_end=true`) and resume both proven to write a `manual:api` audit row even though `status` stays `active` throughout - the concrete case D-020 exists for.
+- 9/9 new integration tests, 26/26 total integration tests (all of Phase 2/3's still passing after the `sync.ts` refactor), 40/40 unit tests (8 new for idempotency-key determinism).
+
+**Open items carried forward:**
+1. Live end-to-end verification against the real Railway Postgres and real Stripe API still needs an environment with normal internet access - unchanged since Phase 0.
+2. Stripe CLI still not installed/available - needed for Phase 5's test clocks especially.
+3. A separate demo Postgres database is still needed before Phase 9.
+4. `GET /subscriptions` (list, with filters) and `GET /invoices` from §6's API surface weren't built this phase - deferred to whenever Phase 7's admin UI actually needs them, since they weren't part of Phase 4's stated scope and adding them speculatively wasn't warranted.

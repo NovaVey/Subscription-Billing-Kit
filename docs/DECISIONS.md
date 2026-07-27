@@ -147,3 +147,17 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Read `invoice.subscription` and `paymentIntent.invoice` directly — the shape assumed by most existing tutorials, blog posts, and this pinned version's predecessors.
 **Why it lost:** Checked against the installed Stripe SDK's own type definitions (generated from Stripe's OpenAPI spec for this exact pinned version) rather than recalled from memory or copied from older material: neither field exists on either object in this API version. Both are the Basil period-fields bug's exact shape — a plausible field silently absent, no error, no exception — just discovered on two different objects instead of one.
 **Revisit if:** Never, unless a future API version restructures these again — in which case the fix is the same discipline that caught it here: check the pinned version's actual types before writing the handler.
+
+## D-019 — Customer creation is keyed on external_ref forever; other mutations are keyed on external_ref + a captured timestamp
+**Date:** 2026-07-27 · **Phase:** 4 · **Status:** settled
+**Decision:** `customerCreateKey()` never expires (no timestamp component) and is backed by a local-first DB check. `checkoutSessionKey()`, `portalSessionKey()`, and the subscription plan-change/cancel/resume keys all include a `requestedAt` the caller captures once per logical request.
+**Alternative rejected:** Use the same "operation identity + timestamp" shape for every mutating call, including customer creation.
+**Why it lost:** A customer should only ever exist once per `external_ref`, permanently — a timestamped key would let a retry arriving after Stripe's idempotency-key retention window (currently 24h) create a second Stripe customer. Checkout sessions, plan changes, and cancellations are different: they're legitimately repeatable actions over a subscription's lifetime, so a permanent key would incorrectly block a second, genuinely new plan change to the same price at a later date.
+**Revisit if:** Never for customer creation. For the timestamped operations, revisit only if evidence shows retries commonly arrive later than intended (e.g. a slow client-side retry loop) - the fix would be widening the local-first check pattern, not changing the key shape.
+
+## D-020 — Manual admin actions force an audit row via an explicit flag, not by inferring "was this manual"
+**Date:** 2026-07-27 · **Phase:** 4 · **Status:** settled
+**Decision:** `syncSubscriptionFromStripe()` takes an explicit `forceRecord` option. Webhook-driven calls leave it unset (record only on status change); the cancel/resume/plan-change routes always pass `forceRecord: true`.
+**Alternative rejected:** Have `syncSubscriptionFromStripe()` infer "this was a manual action" from context (e.g., checking whether `stripeEventId` is null).
+**Why it lost:** An explicit flag says what the caller intends; inferring it from the absence of a webhook event id is indirect and would silently change behavior if a future caller ever synced from a manual action that happened to have an event id available (or vice versa). §5.8 requires every manual mutation to hit the audit trail regardless of whether status changed - that requirement belongs at the call site that knows it's handling a manual action, not buried in a heuristic.
+**Revisit if:** Never — this is a one-line flag, not a maintenance burden.
