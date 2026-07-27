@@ -5,6 +5,7 @@ import { db } from '../../db/client.js';
 import { customers, invoices, subscriptions } from '../../db/schema.js';
 import { logger } from '../../lib/logger.js';
 import { fromStripeSeconds, fromStripeSecondsOrNull } from '../../lib/time.js';
+import { openDunningCycleOnPaymentFailed, resolveDunningOnInvoicePaid } from '../../billing/dunning.js';
 import type { HandlerResult } from './customer.js';
 
 function resolveId(ref: string | { id: string } | null | undefined): string | undefined {
@@ -113,11 +114,33 @@ export async function handleInvoiceEvent(event: Stripe.Event): Promise<HandlerRe
     lastEventAt: eventCreatedAt,
   };
 
-  if (existing) {
-    await db.update(invoices).set(row).where(eq(invoices.id, existing.id));
-  } else {
-    await db.insert(invoices).values(row);
-  }
+  // The invoice upsert and the dunning-cycle side effect it can trigger
+  // must land together (§5.10) - a crash between them could otherwise
+  // leave a paid invoice recorded locally with its dunning cycle still
+  // open, or vice versa.
+  await db.transaction(async (tx) => {
+    let localInvoiceId: string;
+    if (existing) {
+      await tx.update(invoices).set(row).where(eq(invoices.id, existing.id));
+      localInvoiceId = existing.id;
+    } else {
+      const [inserted] = await tx.insert(invoices).values(row).returning({ id: invoices.id });
+      localInvoiceId = inserted!.id;
+    }
+
+    // One-off invoices (no subscription link) never enter dunning (§5.10).
+    if (localSubscriptionId) {
+      if (event.type === 'invoice.payment_failed') {
+        await openDunningCycleOnPaymentFailed(tx, {
+          subscriptionId: localSubscriptionId,
+          invoiceId: localInvoiceId,
+          now: eventCreatedAt,
+        });
+      } else if (event.type === 'invoice.paid') {
+        await resolveDunningOnInvoicePaid(tx, { invoiceId: localInvoiceId, now: eventCreatedAt });
+      }
+    }
+  });
 
   return {};
 }

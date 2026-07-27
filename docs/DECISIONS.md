@@ -161,3 +161,31 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Have `syncSubscriptionFromStripe()` infer "this was a manual action" from context (e.g., checking whether `stripeEventId` is null).
 **Why it lost:** An explicit flag says what the caller intends; inferring it from the absence of a webhook event id is indirect and would silently change behavior if a future caller ever synced from a manual action that happened to have an event id available (or vice versa). §5.8 requires every manual mutation to hit the audit trail regardless of whether status changed - that requirement belongs at the call site that knows it's handling a manual action, not buried in a heuristic.
 **Revisit if:** Never — this is a one-line flag, not a maintenance burden.
+
+## D-021 — Escalation gaps are measured from the stage just entered, not cumulatively from the cycle's original open
+**Date:** 2026-07-27 · **Phase:** 5 · **Status:** settled
+**Decision:** `nextActionAtForStage()` computes each escalation's due time as `entered_stage_at + gap`, where the 3/7/14-day gaps from §5.10's table apply relative to whichever stage a cycle just entered — day 0 opens stage 1, +3 days from *that* escalates to stage 2, +7 days from *stage 2's own entry* escalates to stage 3, +14 days from *stage 3's own entry* reaches stage 4.
+**Alternative rejected:** Read the table as a fixed, cumulative timeline from the cycle's original open (day 0/3/7/14 all measured from the first `invoice.payment_failed`).
+**Why it lost:** Both readings are grammatically defensible from the table's text alone, but `dunning_state` only has a single, mutable `entered_stage_at` column — no separate "cycle opened at" timestamp. A cumulative-from-open design would need that second column to know how much time has elapsed since the cycle *started*, independent of the current stage; its absence from §4's schema is the deciding evidence for the relative reading, not a guess.
+**Revisit if:** A real dunning cadence review calls for cumulative timing — that would need a schema change (an `opened_at` column) alongside it, not just a code change.
+
+## D-022 — Notice escalation and notice sending are two separate passes, not one atomic step
+**Date:** 2026-07-27 · **Phase:** 5 · **Status:** settled
+**Decision:** `runDunningTick()` runs an escalation pass (advance `dunning_state.stage` and arm the target `dunning_notices` row, `sent_at` left null, in one transaction) and then a send pass that scans *every* `dunning_notices` row with `sent_at is null` system-wide — not just the ones this tick's own escalation pass just armed — and sends each exactly once.
+**Alternative rejected:** Advance the stage, write the notice row, call the email adapter, and record `sent_at`, all as steps of one continuous operation per due cycle.
+**Why it lost:** A crash after the stage-advance-plus-arm transaction commits but before the send confirms would otherwise strand that notice forever — the escalation pass's own selection criteria (`stage = fromStage AND next_action_at <= now`) no longer matches a row whose stage has already advanced, so nothing would ever retry the send. A decoupled, system-wide "send anything unsent" pass is what actually satisfies D-013's crash-safety property, not the unique constraint alone.
+**Revisit if:** Never, unless notices gain their own independent retry/backoff schedule distinct from the tick interval.
+
+## D-023 — `customer.subscription.deleted` closes an open dunning cycle as `resolution='canceled'`; a pure stage-4 timeout does not
+**Date:** 2026-07-27 · **Phase:** 5 · **Status:** settled
+**Decision:** `closeDunningOnSubscriptionDeleted()` sets `stage=4`, `resolved_at=now()`, `resolution='canceled'` when a subscription is actually deleted while a cycle is open. Reaching stage 4 purely by the +14-day timeout (§5.10's table) advances `stage` and stops escalating, but leaves `resolved_at`/`resolution` null — the cycle stays open, just parked at its terminal stage.
+**Alternative rejected:** Treat both stage-4 triggers identically - just a stage number, no distinct resolution.
+**Why it lost:** `dunning_state.resolution`'s enum (`recovered`/`canceled`/`manual`) has no other event in this codebase that could ever produce `'canceled'` - the table's own vocabulary implies it exists for exactly this case. A subscription that's actually gone in Stripe has nothing left to collect on, so closing the cycle is correct; a subscription merely stuck at stage 4 while still nominally active might still recover via a late `invoice.paid` on the triggering invoice, so it must stay open.
+**Revisit if:** Never.
+
+## D-024 — Stage 4 sends no notice; access enforcement is the integrating product's job, not this kit's
+**Date:** 2026-07-27 · **Phase:** 5 · **Status:** settled
+**Decision:** `escalateDueCycles()` arms and sends a notice for stages 1-3 only. Stage 4's action per §5.10's table is "access revoked, marked terminal" - a state change this kit records as `dunning_state.stage`, not a communication it sends and not a feature flag it flips anywhere else.
+**Alternative rejected:** Add a `feature_downgraded`/`access_revoked` boolean (or similar) to `dunning_state` and a fourth notice template for stage 4.
+**Why it lost:** §4's schema is the exhaustive table list for this build; inventing a new column for "access state" would duplicate information the `stage` integer already carries ordinally (`stage >= 3` is the downgrade signal, `stage >= 4` is the revoked signal) for a system whose job, per §1, is billing infrastructure - not the SaaS product's own feature-gating. The integrating product reads `dunning_state.stage` (via `GET /dunning/queue` or `GET /subscriptions/:id`) and decides what "downgraded" or "revoked" means for its own UI and access checks. Table rows 1-3 describe communications (banner, email, second email, final notice); row 4 describes a state change - the asymmetry in the spec's own wording is the signal, not an oversight to paper over.
+**Revisit if:** A client's product can't do its own stage-based gating and needs this kit to expose a purpose-built boolean - a scoped addition, not a reinterpretation of what exists today.
