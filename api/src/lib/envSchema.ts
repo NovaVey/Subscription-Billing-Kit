@@ -18,6 +18,10 @@ export const EnvSchema = z.object({
   STRIPE_API_VERSION: z
     .string()
     .min(1, 'STRIPE_API_VERSION is required — pin it deliberately, see docs/ARCHITECTURE.md §5.1'),
+  // Optional at the schema level so the app can still boot and serve /health
+  // without it — but the webhook route (Phase 2) refuses every request with a
+  // loud 500 if it's missing, rather than silently misbehaving. See
+  // api/src/webhooks/receiver.ts.
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
   STRIPE_PORTAL_CONFIG_ID: z.string().optional(),
   APP_BASE_URL: z.string().url().default('http://localhost:5173'),

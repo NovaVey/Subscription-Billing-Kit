@@ -126,3 +126,10 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Include every currency that's "really" zero-decimal, going by general currency knowledge.
 **Why it lost:** Confirmed against Stripe's current currencies reference rather than assumed from memory: Stripe kept UGX and ISK API amounts two-decimal for backward compatibility (the decimal digits are always `"00"`, but the API still expects amounts multiplied by 100). Adding them to the zero-decimal set would silently undercharge every UGX or ISK invoice by 100x — the same class of bug D-001 exists to prevent, just discovered from the opposite direction: assuming a currency is zero-decimal without checking, instead of assuming it isn't.
 **Revisit if:** Stripe changes UGX/ISK's API treatment (their currencies reference is the source of truth to recheck, not this entry).
+
+## D-016 — The pg Pool gets an explicit `'error'` listener
+**Date:** 2026-07-27 · **Phase:** 2 · **Status:** settled
+**Decision:** `api/src/db/client.ts`'s `pool.on('error', ...)` logs idle-client connection errors instead of leaving them unhandled.
+**Alternative rejected:** No listener — the pattern most `pg.Pool` examples (including Stripe/Node tutorials in general) show by default.
+**Why it lost:** Discovered live while demonstrating Phase 2's "DB down → 500" checkpoint by actually stopping Postgres mid-request: without this listener, the idle client's connection-terminated error was an *unhandled* `EventEmitter` `'error'` event, which Node treats as fatal — it crashed the entire process, taking down every in-flight request, not just the one that happened to be querying. A routine database restart shouldn't be able to take the whole service offline.
+**Revisit if:** Never — this listener costs nothing and the failure mode it prevents is total.

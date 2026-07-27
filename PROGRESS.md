@@ -91,3 +91,47 @@ Running log of what's been built, by phase. This is how a new session resumes: r
 3. Stripe CLI is still not installed anywhere available to this project — needed starting Phase 2 for `stripe listen`/`stripe trigger`.
 
 **Infrastructure note for future sessions in this sandbox:** Postgres 16 is installed locally (via apt, already present in this container image) and running as a system service (`service postgresql start`; `pg_lsclusters` to check). A `billing_kit_test` database exists there with Phase 1's schema already migrated, reachable at `postgresql://postgres:localtest@localhost:5432/billing_kit_test`. Since this sandbox's network policy blocks reaching the real Railway Postgres entirely (raw TCP, no egress path — see Phase 0's entry), this local instance is the only way to run anything DB-related from *this specific container* — including §9's integration tests, which need a real, throwaway Postgres. It will not persist across a fresh container/session; recreate it (`service postgresql start`, `CREATE DATABASE`, `npm run db:migrate` with `DATABASE_URL` pointed at it) if a new session needs it and the Railway DB is still unreachable.
+
+## Phase 2 — Webhook receiver + ledger
+
+**Date:** 2026-07-27
+
+**Status:** Code complete, all exit criteria verified both by an automated integration suite and by a live manual demonstration. Committed.
+
+**Files touched:**
+- `api/src/webhooks/receiver.ts` — `POST /webhooks/stripe`, its own scoped raw-body content-type parser, signature verification, persist-then-ack
+- `api/src/webhooks/ledger.ts` — `recordWebhookEvent()`, the on-conflict-do-nothing insert
+- `api/src/app.ts` — registers `webhookRoutes` as its own plugin (encapsulation keeps the raw-body parser off every other route)
+- `api/src/db/client.ts` — added `pool.on('error', ...)` (see below — a real bug found live, not planned work)
+- `api/src/lib/envSchema.ts` — comment clarifying `STRIPE_WEBHOOK_SECRET`'s optional-at-schema/hard-required-at-route-runtime design
+- `api/test/integration/webhookReceiver.test.ts`, `webhookNonAscii.test.ts`, `webhookDbDown.test.ts`, `helpers/webhookFixture.ts`
+- `docs/ARCHITECTURE.md` — raw body, persist-ack-process ordering, inbound idempotency, and the pool-error finding
+- `docs/DECISIONS.md` — D-016 (pool error listener)
+- `.env` — `STRIPE_WEBHOOK_SECRET` set to a locally-generated dev secret (see verification notes below for why)
+
+**Decisions made:**
+- Raw-body parsing is scoped via Fastify plugin encapsulation (`app.register(webhookRoutes)` with its own `addContentTypeParser` inside), not a global override — every other route keeps normal JSON parsing. This is the standard, documented Fastify pattern for exactly this need, not a workaround.
+- `STRIPE_WEBHOOK_SECRET` stays *optional* in the Zod env schema (so the app can still boot and serve `/health` without it) but the webhook route itself refuses every request with a `500` if it's unset — a config problem, deliberately not a `400`, since `400` tells Stripe "don't retry" and this is recoverable the moment the secret is configured.
+- No `idempotency.ts` module yet — that's explicitly Phase 4 scope (outbound calls). Phase 2's idempotency is purely inbound (`stripe_event_id` primary key + `on conflict do nothing`), which is all this phase needs.
+
+**How the exit criteria were verified — two layers, both passing:**
+
+1. **Automated integration tests** (`npm run test:integration`, against the local `billing_kit_test` Postgres — real network access to Stripe still isn't available from this sandbox, so fixtures are signed locally): Stripe's own SDK exposes `stripe.webhooks.generateTestHeaderString({ payload, secret })` for exactly this purpose — signature verification is a pure local HMAC operation, so a correctly-signed fixture exercises the real signature-checking code path with no network call to Stripe needed at all.
+   - A validly-signed event → `200`, one row.
+   - The same signed payload replayed 10 times → `200` every time, still exactly one row.
+   - A tampered signature → `400`, zero rows, warning logged.
+   - A missing `stripe-signature` header → `400`.
+   - Non-ASCII content in the event payload (`Zoë Müller — 田中太郎 — Ñoño 🎉`) → `200`, and the stored `jsonb` payload round-trips the exact string.
+   - DB unreachable (`pool.end()`, isolated to its own test file so it can't affect other integration tests) → `500`, not `200`.
+   - 6/6 passing.
+
+2. **Live manual demonstration**, per this phase's explicit checkpoint — built the real server, pointed `.env` at the local Postgres, generated real signed fixtures with a small throwaway script (not committed), and used actual `curl` + `psql`:
+   - Sent one signed event 3 times → `200` all three times, exactly one row in `webhook_events` via `psql`.
+   - Stopped the local Postgres service (`service postgresql stop`) mid-session and POSTed a webhook — **this crashed the entire Node process** instead of returning `500`. Root cause: `pg.Pool` emits `'error'` on an idle client hitting a connection-level failure, and an unhandled `EventEmitter` `'error'` event is fatal to Node. Fixed with `pool.on('error', ...)` in `db/client.ts` (see D-016). Rebuilt, repeated the exact same demonstration: this time got a clean `500`, and the server stayed up. Restarted Postgres and resent the same event — `200`, and the row landed with no duplicate.
+   - This was a genuine bug caught by actually performing the checkpoint's literal instructions ("with the DB stopped...") rather than only reasoning about the failure mode abstractly — the kind of thing this whole project exists to catch.
+   - `stripe listen --forward-to ...` / `stripe trigger customer.created` themselves were not run — the Stripe CLI still isn't available in this sandbox, and this sandbox still can't reach `api.stripe.com` directly (Phase 0's finding). The locally-signed-fixture approach exercises the identical code path (everything downstream of "a validly-signed payload arrived"), which is what actually matters for this phase's logic; running the literal CLI commands is still worth doing the first time this runs somewhere with normal Stripe connectivity.
+
+**Open items carried forward:**
+1. Still true from Phase 1: live end-to-end verification against the real Railway Postgres and real Stripe API needs an environment with normal internet access.
+2. Stripe CLI still not installed/available anywhere in this project's reach — needed from here on for `stripe listen`/`stripe trigger`, and for Phase 5's test clocks.
+3. A separate demo Postgres database is still needed before Phase 9.
