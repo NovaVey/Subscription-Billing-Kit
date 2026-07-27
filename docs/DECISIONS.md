@@ -119,3 +119,10 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Our own retry schedule.
 **Why it lost:** Two independent retry schedules against one invoice risks double charges, and Stripe's retry timing is tuned on far more data than we have.
 **Revisit if:** A client has Smart Retries disabled and explicitly wants us to own it — a scoped change, quoted separately.
+
+## D-015 — UGX (and ISK) are excluded from the zero-decimal set
+**Date:** 2026-07-27 · **Phase:** 1 · **Status:** settled
+**Decision:** `money.ts`'s zero-decimal currency set omits UGX and ISK, even though both are conceptually zero-decimal currencies today.
+**Alternative rejected:** Include every currency that's "really" zero-decimal, going by general currency knowledge.
+**Why it lost:** Confirmed against Stripe's current currencies reference rather than assumed from memory: Stripe kept UGX and ISK API amounts two-decimal for backward compatibility (the decimal digits are always `"00"`, but the API still expects amounts multiplied by 100). Adding them to the zero-decimal set would silently undercharge every UGX or ISK invoice by 100x — the same class of bug D-001 exists to prevent, just discovered from the opposite direction: assuming a currency is zero-decimal without checking, instead of assuming it isn't.
+**Revisit if:** Stripe changes UGX/ISK's API treatment (their currencies reference is the source of truth to recheck, not this entry).

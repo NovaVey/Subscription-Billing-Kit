@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Stripe subscription billing that survives production.",
   "license": "MIT",
+  "type": "module",
   "engines": {
     "node": ">=20"
   },
@@ -14,11 +15,12 @@
     "dev": "npm run dev --workspace=api",
     "build": "npm run build --workspace=api",
     "start": "npm run start --workspace=api",
-    "lint": "npm run lint --workspace=api",
-    "typecheck": "npm run typecheck --workspace=api",
+    "lint": "eslint scripts --max-warnings=0 && npm run lint --workspace=api",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck --workspace=api",
     "test:unit": "npm run test:unit --workspace=api",
     "test:integration": "npm run test:integration --workspace=api",
     "db:generate": "npm run db:generate --workspace=api",
-    "db:migrate": "npm run db:migrate --workspace=api"
+    "db:migrate": "npm run db:migrate --workspace=api",
+    "seed:catalog": "tsx scripts/seed-catalog.ts"
   }
 }
