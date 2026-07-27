@@ -21,6 +21,7 @@
     "test:integration": "npm run test:integration --workspace=api",
     "db:generate": "npm run db:generate --workspace=api",
     "db:migrate": "npm run db:migrate --workspace=api",
-    "seed:catalog": "tsx scripts/seed-catalog.ts"
+    "seed:catalog": "tsx scripts/seed-catalog.ts",
+    "dunning:tick": "tsx scripts/dunning-tick.ts"
   }
 }

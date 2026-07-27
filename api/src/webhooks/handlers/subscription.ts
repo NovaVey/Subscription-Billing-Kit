@@ -6,6 +6,7 @@ import { subscriptions } from '../../db/schema.js';
 import { logger } from '../../lib/logger.js';
 import { fromStripeSeconds } from '../../lib/time.js';
 import { syncSubscriptionFromStripe } from '../../stripe/sync.js';
+import { closeDunningOnSubscriptionDeleted } from '../../billing/dunning.js';
 import type { HandlerResult } from './customer.js';
 
 export async function handleSubscriptionEvent(event: Stripe.Event): Promise<HandlerResult> {
@@ -36,11 +37,17 @@ export async function handleSubscriptionEvent(event: Stripe.Event): Promise<Hand
     expand: ['items.data.price'],
   });
 
-  await syncSubscriptionFromStripe(subscription, {
+  const result = await syncSubscriptionFromStripe(subscription, {
     reason: event.type,
     stripeEventId: event.id,
     lastEventAt: eventCreatedAt,
   });
+
+  // A deleted subscription has nothing left to collect on - closes any
+  // open dunning cycle as 'canceled' rather than leaving it open (§5.10).
+  if (event.type === 'customer.subscription.deleted') {
+    await closeDunningOnSubscriptionDeleted(db, { subscriptionId: result.id, now: eventCreatedAt });
+  }
 
   return {};
 }

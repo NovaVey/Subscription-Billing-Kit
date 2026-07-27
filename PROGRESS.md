@@ -234,3 +234,44 @@ Verified locally: ran the exact new start sequence (`node dist/db/migrate.js && 
 **Open items carried forward:**
 1. `STRIPE_WEBHOOK_SECRET` is still not set on Railway - the local sandbox's value was generated for local `stripe listen` testing and is **not** the deployed endpoint's real signing secret (per the runbook note in the phase 9 spec: these are always different values). Creating the real webhook endpoint against this Railway deployment's public URL requires either a real Stripe Dashboard session or API access this sandbox doesn't have - unchanged blocker, carried forward.
 2. No public domain is provisioned for this Railway service yet (`railway_list_domains` returned none) - needed before Checkout/portal return URLs or a real webhook endpoint can point at it.
+
+## Phase 5 — Test clock helpers + dunning engine
+
+**Date:** 2026-07-27
+
+**Status:** Code complete, all exit criteria verified via a deterministic integration suite (no live Stripe test clock available from this sandbox - see below). Committed.
+
+**Files touched:**
+- `api/src/billing/emailAdapter.ts` — `EmailAdapter` interface, `ConsoleEmailAdapter` default implementation
+- `api/src/billing/dunning.ts` — the stage machine: `openDunningCycleOnPaymentFailed`, `resolveDunningOnInvoicePaid`, `closeDunningOnSubscriptionDeleted`, `runDunningTick` (escalation pass + decoupled send pass), plus exported pure helpers `nextActionAtForStage`/`templateForStage`/`STAGE_GAP_DAYS` for unit testing
+- `api/src/webhooks/handlers/invoice.ts` — wraps the invoice upsert and its dunning side effect (open on `invoice.payment_failed`, resolve on `invoice.paid`) in one transaction
+- `api/src/webhooks/handlers/subscription.ts` — closes an open cycle as `resolution='canceled'` on `customer.subscription.deleted`
+- `api/src/webhooks/worker.ts` — dunning tick added as a third in-process interval (15 min), gated by `env.DUNNING_ENABLED`
+- `api/src/routes/dunning.ts` (new) — `GET /dunning/queue`, `POST /dunning/:id/resolve`; wired into `app.ts`
+- `scripts/test-clock.ts` (new) — `createTestClock`/`advanceTestClock`/`teardownTestClock`, verified against the installed Stripe SDK's own `TestHelpers/TestClocks.d.ts`
+- `scripts/dunning-tick.ts` (new) — one-shot entry point for a production cron (§5.12); root `package.json` gained `dunning:tick`
+- `api/test/unit/dunning.test.ts` — escalation timing and template-selection pure-logic coverage
+- `api/test/integration/dunning.test.ts` — the 5 named §9 dunning tests, plus a sixth exercising the full stage 1→3→recovered arc deterministically
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (D-021 through D-024; D-012/D-013/D-014 were already seeded pre-Phase-0 and matched this implementation directly)
+
+**Decisions made:**
+- Escalation gaps (3/7/14 days, §5.10) are read as relative to whichever stage a cycle just entered, not cumulative from the cycle's original open — `dunning_state`'s single, mutable `entered_stage_at` column (no separate "cycle opened at" timestamp) is the schema-level evidence for that reading over the other equally-plausible one. See D-021.
+- Escalating a stage and sending that stage's notice are two separate, decoupled steps: the escalation transaction advances `dunning_state.stage` and arms the notice row (`sent_at` left null); a completely separate pass scans *every* unsent notice system-wide and sends it. This is what actually makes the "one notice per stage" unique constraint (D-013, pre-seeded) crash-safe in practice — a crash between the two steps would otherwise strand the notice forever, since the escalation pass's own selection criteria stop matching a cycle once its stage has already advanced. See D-022.
+- `customer.subscription.deleted` closes an open cycle as `resolution='canceled'` (nothing left to collect on a deleted subscription); a pure +14-day timeout to stage 4 only advances `stage` and leaves the cycle open, since a late `invoice.paid` on the triggering invoice can still recover it. This is the only event in the whole system that could ever produce `resolution='canceled'`, which is the deciding evidence it belongs here. See D-023.
+- Stage 4 sends no notice (§5.10's table describes it as an access change, not a communication, unlike stages 1-3) and this kit does not invent a new "access revoked" column — `dunning_state.stage` itself is the signal an integrating product reads to decide what downgrading or revoking access means for its own UI. See D-024.
+- `routes/dunning.ts` is its own file rather than the `routes/admin.ts` named in §3's original repo layout — Phase 4 already established one-file-per-API-concern (`checkout.ts`, `portal.ts` instead of a combined admin file), and this phase follows that precedent rather than retrofitting a file name that was never actually used.
+
+**How the exit criteria were verified, and why not via a real test clock:** this sandbox still has no network path to `api.stripe.com` (unchanged since Phase 0), so `scripts/test-clock.ts` is written and verified against the installed SDK's real type definitions but never actually exercised against Stripe from here — the same constraint that shaped every prior phase's checkpoint. The stage-machine behavior the exit criteria actually care about (a cycle escalating through every stage and recovering) doesn't depend on Stripe's test-clock API itself, only on the tick logic that would run regardless of what advanced the clock — so `test/integration/dunning.test.ts` proves it deterministically by backdating `dunning_state.next_action_at` and calling `runDunningTick()` directly, exercising the exact same code path a real test clock's time jump would trigger:
+- `payment-failed-then-paid-clears-dunning-in-one-tick` — a cycle opens on `invoice.payment_failed` and resolves on `invoice.paid` for the *same* invoice, with no tick needed in between (resolution is synchronous with the webhook handler, only escalation needs the scheduled tick).
+- `paying-an-unrelated-invoice-does-not-clear-dunning` — a second, different invoice for the same subscription being paid leaves the cycle open at stage 1, still pointed at the original triggering invoice.
+- `a-one-off-invoice-failure-never-opens-a-dunning-cycle` — a `payment_failed` invoice with `parent: null` (no subscription link) produces no `dunning_state` row at all.
+- `dunning-never-sends-two-notices-for-one-stage` — a cycle due for escalation, ticked twice in a row, escalates exactly once and sends exactly one email for the new stage.
+- `crash-between-notice-write-and-send-does-not-double-email` — a `dunning_notices` row seeded to look exactly like a crash left it (armed, `sent_at` null, stage already advanced), ticked twice, sends exactly once.
+- A sixth test drives a cycle from stage 1 through stage 3 via repeated ticks (backdating `next_action_at` each time), confirms exactly one notice per stage 1/2/3 all marked sent, then resolves it via `invoice.paid` — the full arc the phase's exit criteria describe, short of the literal test-clock/teardown mechanics.
+- 6/6 new integration tests, 32/32 integration tests total, 45/45 unit tests (5 new for escalation timing), clean typecheck/lint/build. A live boot (`GET /health`, `GET /dunning/queue`) against the local Postgres confirmed the new route serves cleanly end-to-end.
+
+**Open items carried forward:**
+1. Live end-to-end verification against the real Railway Postgres and real Stripe API (including an actual test-clock run) still needs an environment with normal internet access — unchanged since Phase 0.
+2. `STRIPE_WEBHOOK_SECRET` still isn't set on Railway, and no public domain is provisioned there yet — carried forward from the migrate-on-boot infrastructure fix above.
+3. A separate demo Postgres database is still needed before Phase 9.
+4. `scripts/test-clock-demo.ts` (Phase 9's unattended demo arc) intentionally not built this phase — it's explicitly scoped to Phase 9 in §8, and needs the same live Stripe access this sandbox doesn't have to be worth writing before then.

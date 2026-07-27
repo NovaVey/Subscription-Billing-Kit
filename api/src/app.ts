@@ -5,6 +5,7 @@ import { customerRoutes } from './routes/customers.js';
 import { checkoutRoutes } from './routes/checkout.js';
 import { portalRoutes } from './routes/portal.js';
 import { subscriptionRoutes } from './routes/subscriptions.js';
+import { dunningRoutes } from './routes/dunning.js';
 import { webhookRoutes } from './webhooks/receiver.js';
 
 export function buildApp() {
@@ -15,6 +16,7 @@ export function buildApp() {
   app.register(checkoutRoutes);
   app.register(portalRoutes);
   app.register(subscriptionRoutes);
+  app.register(dunningRoutes);
   // Registered as its own plugin so its raw-body content-type parser stays
   // scoped away from every other route — see webhooks/receiver.ts.
   app.register(webhookRoutes);
