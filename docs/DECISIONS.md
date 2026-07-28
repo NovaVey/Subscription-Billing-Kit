@@ -189,3 +189,31 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Add a `feature_downgraded`/`access_revoked` boolean (or similar) to `dunning_state` and a fourth notice template for stage 4.
 **Why it lost:** §4's schema is the exhaustive table list for this build; inventing a new column for "access state" would duplicate information the `stage` integer already carries ordinally (`stage >= 3` is the downgrade signal, `stage >= 4` is the revoked signal) for a system whose job, per §1, is billing infrastructure - not the SaaS product's own feature-gating. The integrating product reads `dunning_state.stage` (via `GET /dunning/queue` or `GET /subscriptions/:id`) and decides what "downgraded" or "revoked" means for its own UI and access checks. Table rows 1-3 describe communications (banner, email, second email, final notice); row 4 describes a state change - the asymmetry in the spec's own wording is the signal, not an oversight to paper over.
 **Revisit if:** A client's product can't do its own stage-based gating and needs this kit to expose a purpose-built boolean - a scoped addition, not a reinterpretation of what exists today.
+
+## D-025 — Reconciliation windows are bounded by `finalized_at`, not `period_start`/`period_end`
+**Date:** 2026-07-28 · **Phase:** 6 · **Status:** settled
+**Decision:** `runReconciliation()` compares Stripe invoices created in a date range against local invoices whose `finalized_at` falls in that same range.
+**Alternative rejected:** Bound the comparison by `invoices.period_start`/`period_end` (the columns already on the table).
+**Why it lost:** `period_start`/`period_end` describe the *service period* an invoice bills for, not when the invoice itself was issued - a one-off invoice or an annual subscription's single invoice can have a service period spanning far outside the reconciliation window while being issued squarely inside it. Reconciliation asks "what did Stripe issue in this window," the same question `stripe.invoices.list({ created })` answers on Stripe's side - `finalized_at` is the closest matching concept §4's schema already has, without inventing a new "created" column for invoices.
+**Revisit if:** The ~1 hour gap between an invoice's real creation and its finalization (see the Phase 5 test-clock verification in `PROGRESS.md`) ever causes a reconciliation window boundary to visibly misclassify an invoice - the fix would be adding a dedicated `created_at` column, a schema change, not a code change.
+
+## D-026 — Reconciliation's headline total is amount actually collected, not amount billed
+**Date:** 2026-07-28 · **Phase:** 6 · **Status:** settled
+**Decision:** `reconciliation_runs.stripe_total_minor`/`local_total_minor` sum each side's `amount_paid_minor` across the window, per currency.
+**Alternative rejected:** Sum `amount_due_minor` (total billed) instead, or report both.
+**Why it lost:** §1 frames the problem reconciliation solves as "does what we billed match what Stripe collected" - the number a client actually wants to see agree is money that moved, not money that was merely invoiced. The detailed `report` entries already catch `amount_due_minor` drift per invoice regardless of this choice, so nothing is lost by picking one figure for the headline total.
+**Revisit if:** A client specifically wants billed-vs-collected shown side by side - additive (a second total column), not a reversal of this one.
+
+## D-027 — Currency filtering happens client-side, after fetching Stripe's invoice list
+**Date:** 2026-07-28 · **Phase:** 6 · **Status:** settled
+**Decision:** `runReconciliation()` fetches every Stripe invoice in the `created` date range (Stripe's only list-level date filter for invoices) and discards ones not matching the requested currency in application code.
+**Alternative rejected:** Assume a `currency` query parameter exists on Stripe's List Invoices endpoint.
+**Why it lost:** Checked against the pinned version's actual API reference (§0 rule 9) rather than assumed: `GET /v1/invoices` has no `currency` filter parameter at all - only `collection_method`, `created`, `customer`, `due_date`, `status`, `subscription`, and pagination cursors. A reconciliation run already only ever asks about one currency at a time (§5.9/§5.10: totals are never summed across currencies), so the extra client-side filter is cheap and correct, just not push-down-able to Stripe's own query.
+**Revisit if:** Stripe adds a currency filter to this endpoint - worth revisiting only if reconciliation windows start returning enough invoices that fetching every currency's worth becomes a real cost, which hasn't been observed.
+
+## D-028 — Reconciliation is a cron-invoked script only; no in-process interval
+**Date:** 2026-07-28 · **Phase:** 6 · **Status:** settled
+**Decision:** `scripts/reconcile-nightly.ts` is the only way the nightly job runs - there is no `setInterval` for it in `webhooks/worker.ts`, unlike the dunning tick.
+**Alternative rejected:** Give reconciliation its own short-interval loop in the same in-process worker as the webhook processor/reaper/dunning tick, matching §5.12's "every 15 min in dev, cron in prod" framing for dunning.
+**Why it lost:** §5.11 describes reconciliation as "nightly job + on-demand run" without that same dev-interval language - a once-a-day job has no dev-testing reason to run every few minutes the way dunning's escalation logic did (dunning needed a fast loop specifically so a test clock's simulated days could be observed ticking forward in real seconds). The on-demand path (`POST /admin/reconciliation/run`) already covers ad hoc/manual runs and testing.
+**Revisit if:** A client wants automatic nightly runs without relying on their own infrastructure's cron - at that point this could move into the in-process worker gated by a check like "has today's run already happened," not a bare interval.
