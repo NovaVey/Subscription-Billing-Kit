@@ -1,6 +1,9 @@
 import { eq } from 'drizzle-orm';
+import Fastify from 'fastify';
+import pino from 'pino';
 import { afterAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../../src/app.js';
+import { webhookRoutes } from '../../src/webhooks/receiver.js';
 import { db, pool } from '../../src/db/client.js';
 import { webhookEvents } from '../../src/db/schema.js';
 import { signFixture } from './helpers/webhookFixture.js';
@@ -39,12 +42,12 @@ describe('webhook receiver', () => {
     expect(rows[0]?.status).toBe('received');
   });
 
-  describe('replaying the same event 10 times changes nothing', () => {
-    it('leaves exactly one row after 10 replays of the same signed payload', async () => {
+  describe('replaying the same event 100 times changes nothing', () => {
+    it('leaves exactly one row after 100 replays of the same signed payload', async () => {
       const { payload, signatureHeader, event } = signFixture();
       createdEventIds.push(event.id);
 
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 100; i++) {
         const response = await app.inject({
           method: 'POST',
           url: '/webhooks/stripe',
@@ -62,13 +65,36 @@ describe('webhook receiver', () => {
   });
 
   describe('webhook with a bad signature is rejected and logged', () => {
-    it('returns 400 and persists nothing for a tampered signature', async () => {
+    // "Rejected" alone is checked against the shared `app` above, same as
+    // every other test in this file. "...and logged" needs a real log
+    // destination to assert against, which the shared app's logger (built
+    // once in src/lib/logger.ts) doesn't expose - a pino child logger's
+    // methods aren't the same function reference as the root instance's, so
+    // spying on the root logger would never see req.log.warn(...) calls.
+    // This standalone app registers the same webhookRoutes plugin app.ts
+    // uses, wired to a pino instance whose destination is a plain in-memory
+    // array, so the actual NDJSON log lines receiver.ts writes can be
+    // inspected directly.
+    function buildAppWithCapturedLogs() {
+      const lines: string[] = [];
+      const destination = { write: (chunk: string) => { lines.push(chunk); return true; } };
+      const testApp = Fastify({ loggerInstance: pino({ level: 'warn' }, destination) });
+      testApp.register(webhookRoutes);
+      return { testApp, lines };
+    }
+
+    function parsedLogs(lines: string[]): Array<{ level: number; msg: string }> {
+      return lines.map((line) => JSON.parse(line));
+    }
+
+    it('returns 400, persists nothing, and logs a warning for a tampered signature', async () => {
       const { payload, event } = signFixture();
       // Don't push to createdEventIds cleanup on purpose - proving no row
       // exists is the point, but harmless to also attempt cleanup.
       createdEventIds.push(event.id);
+      const { testApp, lines } = buildAppWithCapturedLogs();
 
-      const response = await app.inject({
+      const response = await testApp.inject({
         method: 'POST',
         url: '/webhooks/stripe',
         headers: {
@@ -81,13 +107,18 @@ describe('webhook receiver', () => {
       expect(response.statusCode).toBe(400);
       const rows = await rowsFor(event.id);
       expect(rows).toHaveLength(0);
+      expect(parsedLogs(lines).some((l) => l.level === 40 && l.msg === 'rejected webhook: invalid signature')).toBe(
+        true,
+      );
+      await testApp.close();
     });
 
-    it('returns 400 when the stripe-signature header is missing entirely', async () => {
+    it('returns 400, persists nothing, and logs a warning when the stripe-signature header is missing entirely', async () => {
       const { payload, event } = signFixture();
       createdEventIds.push(event.id);
+      const { testApp, lines } = buildAppWithCapturedLogs();
 
-      const response = await app.inject({
+      const response = await testApp.inject({
         method: 'POST',
         url: '/webhooks/stripe',
         headers: { 'content-type': 'application/json' },
@@ -97,6 +128,12 @@ describe('webhook receiver', () => {
       expect(response.statusCode).toBe(400);
       const rows = await rowsFor(event.id);
       expect(rows).toHaveLength(0);
+      expect(
+        parsedLogs(lines).some(
+          (l) => l.level === 40 && l.msg === 'webhook request missing stripe-signature header',
+        ),
+      ).toBe(true);
+      await testApp.close();
     });
   });
 });

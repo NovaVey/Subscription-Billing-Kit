@@ -1,12 +1,101 @@
 import { describe, expect, it } from 'vitest';
 import { ALL_STATUSES, isExpectedTransition, type SubscriptionStatus } from '../../src/billing/stateMachine.js';
 
+// A literal, test-owned copy of every (from, to) pair's expected value -
+// transcribed by hand from src/billing/stateMachine.ts's EXPECTED_TRANSITIONS
+// table (plus the from=null and from===to override rules), kept as data
+// here rather than imported, so a future edit that silently drops or swaps
+// one entry in the source table fails this test instead of passing it
+// vacuously. The 6 tests below only sample ~29 of these 64 pairs by name;
+// this is the one that checks every entry's actual value, not just its type.
+const EXPECTED_TRANSITION_TABLE: Record<SubscriptionStatus, Record<SubscriptionStatus, boolean>> = {
+  trialing: {
+    trialing: true,
+    active: true,
+    past_due: true,
+    unpaid: true,
+    paused: true,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  active: {
+    trialing: false,
+    active: true,
+    past_due: true,
+    unpaid: true,
+    paused: true,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  past_due: {
+    trialing: false,
+    active: true,
+    past_due: true,
+    unpaid: true,
+    paused: false,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  unpaid: {
+    trialing: false,
+    active: true,
+    past_due: true,
+    unpaid: true,
+    paused: false,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  paused: {
+    trialing: false,
+    active: true,
+    past_due: false,
+    unpaid: false,
+    paused: true,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  canceled: {
+    trialing: false,
+    active: false,
+    past_due: false,
+    unpaid: false,
+    paused: false,
+    canceled: true,
+    incomplete: false,
+    incomplete_expired: false,
+  },
+  incomplete: {
+    trialing: false,
+    active: true,
+    past_due: false,
+    unpaid: false,
+    paused: false,
+    canceled: true,
+    incomplete: true,
+    incomplete_expired: true,
+  },
+  incomplete_expired: {
+    trialing: false,
+    active: false,
+    past_due: false,
+    unpaid: false,
+    paused: false,
+    canceled: false,
+    incomplete: false,
+    incomplete_expired: true,
+  },
+};
+
 describe('every state machine transition is covered', () => {
-  it('returns a defined boolean for every (from, to) pair across all 8 statuses — none fall through undefined', () => {
+  it('matches the exact expected value for all 64 (from, to) pairs across all 8 statuses', () => {
     for (const from of ALL_STATUSES) {
       for (const to of ALL_STATUSES) {
-        const result = isExpectedTransition(from, to);
-        expect(typeof result).toBe('boolean');
+        expect(isExpectedTransition(from, to)).toBe(EXPECTED_TRANSITION_TABLE[from][to]);
       }
     }
   });
