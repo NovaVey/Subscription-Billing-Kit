@@ -217,3 +217,31 @@ entry — supersede it with a new one and mark the old one `superseded by D-0NN`
 **Alternative rejected:** Give reconciliation its own short-interval loop in the same in-process worker as the webhook processor/reaper/dunning tick, matching §5.12's "every 15 min in dev, cron in prod" framing for dunning.
 **Why it lost:** §5.11 describes reconciliation as "nightly job + on-demand run" without that same dev-interval language - a once-a-day job has no dev-testing reason to run every few minutes the way dunning's escalation logic did (dunning needed a fast loop specifically so a test clock's simulated days could be observed ticking forward in real seconds). The on-demand path (`POST /admin/reconciliation/run`) already covers ad hoc/manual runs and testing.
 **Revisit if:** A client wants automatic nightly runs without relying on their own infrastructure's cron - at that point this could move into the in-process worker gated by a check like "has today's run already happened," not a bare interval.
+
+## D-029 — CORS is scoped to `APP_BASE_URL`, not a wildcard or a new env var
+**Date:** 2026-07-28 · **Phase:** 7 · **Status:** settled
+**Decision:** `app.ts` registers `@fastify/cors` with `origin: env.APP_BASE_URL`.
+**Alternative rejected:** `origin: true` (reflect any requesting origin), or a new `ADMIN_UI_ORIGIN` env var.
+**Why it lost:** §2 already defines `APP_BASE_URL` as "the admin UI's own base URL" (`http://localhost:5173` in dev); it names exactly the one origin that legitimately calls these admin endpoints from a browser. A wildcard would work but would let any web page's script call the admin API using an admin's cookies/credentials if one were ever added - unnecessary exposure for a value already available. Inventing a second env var for the same fact the config already states would be redundant, not more precise.
+**Revisit if:** The admin UI is ever served from more than one origin (e.g. a staging domain and a production domain simultaneously) - at that point `origin` would need to become a list, sourced from config, not a hypothetical guess now.
+
+## D-030 — The admin UI keeps its own `money.ts`/`format.ts`, not a shared package
+**Date:** 2026-07-28 · **Phase:** 7 · **Status:** settled
+**Decision:** `web/src/lib/money.ts` re-declares the zero-decimal currency set from `api/src/lib/money.ts` rather than importing the API's module directly.
+**Alternative rejected:** Add a `packages/shared` workspace both `api` and `web` depend on, exporting one canonical `money.ts`.
+**Why it lost:** §3's repo layout names exactly `/api`, `/web`, `/docs`, `/scripts` - no shared package. The API's `money.ts` does more than the frontend needs (`toMinor`, `addSameCurrency`, mixed-currency guards) and is written for server-side correctness (throwing on mixed currencies before a charge is created); the frontend only ever needs one direction - display - so a smaller, purpose-built module is simpler than importing a cross-workspace dependency for a single shared constant. The zero-decimal list itself is Stripe's own published fact, not something that drifts independently on either side, so keeping both copies in sync by hand is a one-line diff if Stripe ever changes it, not an ongoing coordination cost.
+**Revisit if:** A third consumer of this money logic appears (a second frontend, a CLI), at which point a real shared package pays for itself.
+
+## D-031 — react-router-dom, chosen explicitly since §2 doesn't name a router
+**Date:** 2026-07-28 · **Phase:** 7 · **Status:** settled
+**Decision:** `web`'s six screens route through `react-router-dom`'s `createBrowserRouter`.
+**Alternative rejected:** Hand-rolled routing (a switch on `window.location.pathname`), or a different router library.
+**Why it lost:** §2 lists "React + Vite + Tailwind for the admin UI" but doesn't name a router, and §0 rule 5 says to ask before adding any dependency not listed - asked directly, and `react-router-dom` was the answer, as the standard, actively-maintained choice for exactly this shape of app (nested layout, six top-level routes, one with a dynamic `:id` segment).
+**Revisit if:** Never, at this app's scale - a hand-rolled router would only pay off if this became a single-page app with no distinct routes at all, which isn't the direction §7 describes.
+
+## D-032 — `GET /subscriptions/:id` gained a `customer` field; this was a pre-existing gap, not new scope
+**Date:** 2026-07-28 · **Phase:** 7 · **Status:** settled
+**Decision:** The subscription detail route now also selects and returns the linked `customers` row (email, external ref) alongside `subscription`, `items`, `timeline`, `invoices`, `dunning`.
+**Alternative rejected:** Leave the route as-is and have the frontend make a second request (or accept showing only `customer_id`) for the detail screen's header.
+**Why it lost:** §7's subscription detail screen is specified as "header facts, item list... event timeline... invoice list, actions" - a customer's email is the header's most basic fact, and the frontend has no other endpoint that maps a `customer_id` to an email. This was the same class of gap as the missing `dunning` field this route already had before Phase 7 (§6 says this endpoint returns "dunning" - it didn't until now either) - both existed because nothing before the admin UI needed them, not because they were deliberately deferred.
+**Revisit if:** Never - this is the minimum the specified screen needs, not speculative extra surface.

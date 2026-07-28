@@ -1,19 +1,17 @@
 // @ts-check
-// Lints /scripts only — /api and /web each have their own eslint.config.js
-// scoped to that workspace (with its own tsconfig).
 import tseslint from '@typescript-eslint/eslint-plugin';
 import tsparser from '@typescript-eslint/parser';
 
 export default [
   {
-    ignores: ['node_modules/**', 'api/**', 'web/**'],
+    ignores: ['dist/**', 'node_modules/**'],
   },
   {
-    files: ['scripts/**/*.ts'],
+    files: ['**/*.{ts,tsx}'],
     languageOptions: {
       parser: tsparser,
       parserOptions: {
-        project: './tsconfig.json',
+        project: ['./tsconfig.app.json', './tsconfig.node.json'],
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -24,7 +22,7 @@ export default [
       ...tseslint.configs.recommended.rules,
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
       '@typescript-eslint/no-floating-promises': 'error',
-      'no-console': 'off',
+      'no-console': 'warn',
     },
   },
 ];

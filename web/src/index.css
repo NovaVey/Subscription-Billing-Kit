@@ -1,0 +1,60 @@
+@import 'tailwindcss';
+
+/* Design tokens per spec §7 - "ledger, not dashboard." Palette is
+   deliberately narrow: paper/ink/rule are the only surfaces, alert/settled
+   are the only two colors that ever carry meaning. Nothing else gets
+   saturation - no other color is introduced anywhere in the app. */
+@theme {
+  --color-paper: #fbfaf7;
+  --color-ink: #14161a;
+  --color-rule: #dfdcd4;
+  --color-alert: #b4501e;
+  --color-settled: #2f6b4f;
+
+  --font-sans:
+    -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'SF Mono', 'Cascadia Code', 'Roboto Mono', Menlo, Consolas,
+    monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-rule);
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+
+  /* Amounts, ids, and timestamps are always tabular-figure monospace,
+     right-aligned and decimal-aligned per §7 - this is the one utility
+     every number in the app routes through. */
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
