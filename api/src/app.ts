@@ -6,6 +6,7 @@ import { checkoutRoutes } from './routes/checkout.js';
 import { portalRoutes } from './routes/portal.js';
 import { subscriptionRoutes } from './routes/subscriptions.js';
 import { dunningRoutes } from './routes/dunning.js';
+import { reconciliationRoutes } from './routes/reconciliation.js';
 import { webhookRoutes } from './webhooks/receiver.js';
 
 export function buildApp() {
@@ -17,6 +18,7 @@ export function buildApp() {
   app.register(portalRoutes);
   app.register(subscriptionRoutes);
   app.register(dunningRoutes);
+  app.register(reconciliationRoutes);
   // Registered as its own plugin so its raw-body content-type parser stays
   // scoped away from every other route — see webhooks/receiver.ts.
   app.register(webhookRoutes);

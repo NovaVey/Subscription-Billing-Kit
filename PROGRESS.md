@@ -307,3 +307,36 @@ Two real findings surfaced along the way, both now resolved:
 **Open items now resolved:** item 1 above (live test-clock verification) is done, including confirmed teardown of both test clocks used. Remaining, unchanged:
 1. A separate demo Postgres database is still needed before Phase 9.
 2. The inert first Railway domain is still there, still harmless, still needs a manual dashboard deletion.
+
+## Phase 6 — Reconciliation
+
+**Date:** 2026-07-28
+
+**Status:** Code complete, all exit criteria verified via a mocked-Stripe-client integration suite (no CHECKPOINT for this phase per the build spec). Committed.
+
+**Files touched:**
+- `api/src/billing/reconcile.ts` (new) — `classifyInvoices` (pure: field_drift/missing_local/orphan_local classification + per-currency totals), `computeYesterdayWindow` (pure: TZ-bounded "yesterday" via `Intl.DateTimeFormat`, no date library), `runReconciliation` (Stripe fetch + local query + classify + store)
+- `api/src/routes/reconciliation.ts` (new) — `GET /admin/reconciliation` (list runs), `POST /admin/reconciliation/run` ({period_start, period_end, currency}); wired into `app.ts`
+- `scripts/reconcile-nightly.ts` (new) — cron-invoked entry point: computes yesterday's window in `RECONCILE_TZ`, runs once per distinct currency found in local invoices; root `package.json` gained `reconcile:nightly`
+- `api/test/unit/reconcile.test.ts` — classification correctness (drift/missing/orphan/clean), the "missing + orphan of equal value don't net to clean" case §5.11 calls out explicitly, and `computeYesterdayWindow`'s TZ-boundary correctness (UTC vs `America/New_York` given the same instant)
+- `api/test/integration/reconciliation.test.ts` — the 3 named §9 tests (status drift, amount drift, missing_local) plus orphan_local and a clean-period-stores-zero case, each in the phase's own exit criteria
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (D-025 through D-028)
+
+**Decisions made:**
+- Reconciliation windows are bounded by each local invoice's `finalized_at`, matched against Stripe's own `created` filter on `GET /v1/invoices` - the closest existing concept to "when was this invoice issued," since §4's schema has no dedicated invoice-creation column and inventing one wasn't warranted for a window that only needs day-level precision. See D-025.
+- The headline `stripe_total_minor`/`local_total_minor` sum `amount_paid_minor` (money actually collected) rather than `amount_due_minor` (money billed) - directly answering §1's framing of the problem ("does what we billed match what Stripe collected"), while the detailed report entries still catch amount_due drift per invoice regardless. See D-026.
+- Stripe's List Invoices endpoint has no `currency` query parameter at all (checked against the pinned version's actual parameter list, not assumed) - every invoice in the date window is fetched and filtered to the requested currency in application code. See D-027.
+- No in-process interval for the nightly job, unlike the dunning tick - `scripts/reconcile-nightly.ts` is a cron-invoked script only, since §5.11 doesn't carry the same "fast loop for dev testing" framing §5.12 gives dunning, and the on-demand API route already covers manual/test runs. See D-028.
+- `classifyInvoices()` is a pure function (plain snapshot objects in, a report + totals out) with no Stripe SDK or Drizzle row type dependency, mirroring the split already established between `stateMachine.ts`/`recordTransition()` and `billing/dunning.ts`'s `nextActionAtForStage()`/the DB-touching escalation functions - the part worth unit-testing in isolation is kept free of I/O.
+
+**How the exit criteria were verified:** this sandbox still can't reach `api.stripe.com` (unchanged since Phase 0), so `stripe.invoices.list` is mocked (`vi.mock` on `src/stripe/client.js`, matching every prior phase's pattern) while local Postgres reads/writes are real:
+- `reconciliation-catches-a-status-drift` / `reconciliation-catches-an-amount-drift` - a local invoice deliberately seeded with a different `status`/`amount_due_minor` than its mocked Stripe counterpart produces exactly one `field_drift` entry naming the differing field and both values.
+- `reconciliation-catches-an-invoice-stripe-has-and-we-do-not` - a mocked Stripe invoice with no local row produces `missing_local`.
+- An added `orphan_local` test (a local invoice with no Stripe counterpart, matching this phase's own exit criteria even though §9 doesn't name it exactly) and a clean-period test (matching sets → `mismatchCount: 0`, equal totals, and the stored `reconciliation_runs` row reflecting both) round out the phase's stated exit criteria.
+- A unit test proves totals alone would hide the case §5.11 calls out by name: a missing invoice and an orphan invoice of equal value net to equal totals on both sides, while the detailed report still reports both.
+- 5/5 new integration tests, 37/37 integration tests total, 53/53 unit tests (7 new: 5 classification, 2 TZ-window), clean typecheck/lint/build. A live boot check confirmed both new routes respond correctly, including Zod's per-field validation errors on a malformed `POST /admin/reconciliation/run` body.
+
+**Open items carried forward, unchanged:**
+1. A separate demo Postgres database is still needed before Phase 9.
+2. The inert first Railway domain is still there, still harmless, still needs a manual dashboard deletion.
+3. `scripts/reconcile-nightly.ts` is written and unit/integration-tested against mocks and the local Postgres, but - like the dunning tick before its later live verification - has not yet been run against the real Railway deployment's actual invoice history. A future session with real network access could verify it the same way the dunning engine's live test-clock run was verified.
