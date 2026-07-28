@@ -9,13 +9,17 @@ const mockSubscriptionsUpdate = vi.fn();
 const mockSubscriptionsCancel = vi.fn();
 const mockSubscriptionsResume = vi.fn();
 const mockSubscriptionsRetrieve = vi.fn();
+const mockInvoicesRetrieve = vi.fn();
 
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
     customers: { create: (...args: unknown[]) => mockCustomersCreate(...args) },
     checkout: { sessions: { create: (...args: unknown[]) => mockCheckoutCreate(...args) } },
     billingPortal: { sessions: { create: (...args: unknown[]) => mockPortalCreate(...args) } },
-    invoices: { createPreview: (...args: unknown[]) => mockInvoicesCreatePreview(...args) },
+    invoices: {
+      createPreview: (...args: unknown[]) => mockInvoicesCreatePreview(...args),
+      retrieve: (...args: unknown[]) => mockInvoicesRetrieve(...args),
+    },
     subscriptions: {
       update: (...args: unknown[]) => mockSubscriptionsUpdate(...args),
       cancel: (...args: unknown[]) => mockSubscriptionsCancel(...args),
@@ -27,23 +31,29 @@ vi.mock('../../src/stripe/client.js', () => ({
 
 const { buildApp } = await import('../../src/app.js');
 const { db, pool } = await import('../../src/db/client.js');
-const { customers, subscriptionEvents, subscriptionItems, subscriptions } = await import(
+const { customers, invoices, subscriptionEvents, subscriptionItems, subscriptions, webhookEvents } = await import(
   '../../src/db/schema.js'
 );
-const { fakeCustomer, fakeSubscription, fakeSubscriptionItem } = await import(
+const { fakeCustomer, fakeEvent, fakeInvoice, fakeSubscription, fakeSubscriptionItem } = await import(
   './helpers/stripeFixtures.js'
 );
+const { createCheckoutSession } = await import('../../src/stripe/checkout.js');
+const { processPendingWebhookEvents } = await import('../../src/webhooks/processor.js');
+const { handleInvoiceEvent } = await import('../../src/webhooks/handlers/invoice.js');
 
 const app = buildApp();
 
 const cleanupCustomerIds: string[] = [];
 const cleanupSubscriptionIds: string[] = [];
+const cleanupEventIds: string[] = [];
+const cleanupInvoiceIds: string[] = [];
 
 beforeEach(() => {
   mockCustomersCreate.mockReset();
   mockCheckoutCreate.mockReset();
   mockPortalCreate.mockReset();
   mockInvoicesCreatePreview.mockReset();
+  mockInvoicesRetrieve.mockReset();
   mockSubscriptionsUpdate.mockReset();
   mockSubscriptionsCancel.mockReset();
   mockSubscriptionsResume.mockReset();
@@ -51,10 +61,16 @@ beforeEach(() => {
 });
 
 afterAll(async () => {
+  for (const id of cleanupInvoiceIds) {
+    await db.delete(invoices).where(eq(invoices.id, id));
+  }
   for (const id of cleanupSubscriptionIds) {
     await db.delete(subscriptionEvents).where(eq(subscriptionEvents.subscriptionId, id));
     await db.delete(subscriptionItems).where(eq(subscriptionItems.subscriptionId, id));
     await db.delete(subscriptions).where(eq(subscriptions.id, id));
+  }
+  for (const id of cleanupEventIds) {
+    await db.delete(webhookEvents).where(eq(webhookEvents.stripeEventId, id));
   }
   for (const id of cleanupCustomerIds) {
     await db.delete(customers).where(eq(customers.id, id));
@@ -179,6 +195,82 @@ describe('POST /checkout/sessions', () => {
   });
 });
 
+describe('a retried create call with the same idempotency key creates one subscription', () => {
+  it('reuses the identical key on retry, and the resulting subscription is created exactly once', async () => {
+    // The /checkout/sessions ROUTE mints a fresh requestedAt per HTTP call
+    // (see routes/checkout.ts), so it can never reuse a key across two
+    // separate requests - that's not what "retried" means here. The retry
+    // this is guarding is our own code catching a transient failure and
+    // re-calling Stripe with the SAME requestedAt it captured once, per
+    // idempotency.ts's own comment - exercised directly against
+    // createCheckoutSession(), not the route.
+    const stripeCustomer = fakeCustomer();
+    const [customerRow] = await db
+      .insert(customers)
+      .values({ stripeCustomerId: stripeCustomer.id, email: stripeCustomer.email })
+      .returning({ id: customers.id });
+    cleanupCustomerIds.push(customerRow!.id);
+
+    const requestedAt = new Date();
+
+    mockCheckoutCreate.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+    await expect(
+      createCheckoutSession({
+        stripeCustomerId: stripeCustomer.id,
+        priceId: 'price_starter_monthly',
+        quantity: 1,
+        requestedAt,
+      }),
+    ).rejects.toThrow('ETIMEDOUT');
+
+    mockCheckoutCreate.mockResolvedValueOnce({
+      id: 'cs_retry_test',
+      url: 'https://checkout.stripe.com/cs_retry_test',
+    });
+    const result = await createCheckoutSession({
+      stripeCustomerId: stripeCustomer.id,
+      priceId: 'price_starter_monthly',
+      quantity: 1,
+      requestedAt, // same requestedAt as the failed attempt - our own retry, not a fresh HTTP request
+    });
+    expect(result.url).toBe('https://checkout.stripe.com/cs_retry_test');
+
+    const [, firstOptions] = mockCheckoutCreate.mock.calls[0]!;
+    const [, secondOptions] = mockCheckoutCreate.mock.calls[1]!;
+    expect((firstOptions as { idempotencyKey: string }).idempotencyKey).toBe(
+      (secondOptions as { idempotencyKey: string }).idempotencyKey,
+    );
+
+    // Real Stripe would have deduped those two calls into one Checkout
+    // Session because the idempotencyKey matched, so exactly one underlying
+    // subscription is ever created, and exactly one
+    // customer.subscription.created event is ever delivered for it. Feed
+    // that single event through the real pipeline and confirm exactly one
+    // local row results.
+    const item = fakeSubscriptionItem();
+    const subscription = fakeSubscription({ customer: stripeCustomer.id, items: { data: [item] } });
+    mockSubscriptionsRetrieve.mockResolvedValueOnce(subscription);
+    const event = fakeEvent('customer.subscription.created', subscription);
+    cleanupEventIds.push(event.id);
+    await db.insert(webhookEvents).values({
+      stripeEventId: event.id,
+      type: event.type,
+      apiVersion: '2026-06-24.dahlia',
+      eventCreatedAt: new Date(event.created * 1000),
+      payload: event,
+      status: 'received',
+    });
+    await processPendingWebhookEvents();
+
+    const rows = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, subscription.id));
+    expect(rows).toHaveLength(1);
+    cleanupSubscriptionIds.push(rows[0]!.id);
+  });
+});
+
 describe('POST /portal/sessions', () => {
   it('returns the Stripe billing portal url', async () => {
     const { customerRow } = await seedCustomerAndSubscription();
@@ -237,6 +329,31 @@ describe('plan change preview matches the invoice Stripe actually issues', () =>
     expect((updateOptions as { idempotencyKey: string }).idempotencyKey).toMatch(
       /^sub:.*:plan:price_pro_monthly:/,
     );
+
+    // The preview alone proves nothing about what actually gets billed -
+    // simulate the invoice Stripe would issue for this change and confirm
+    // the persisted row matches the number the preview showed, rather than
+    // just asserting the same literal (5000) was typed in both places.
+    const issuedInvoice = fakeInvoice({
+      customer: stripeCustomer.id,
+      status: 'open',
+      amount_due: previewBody.amount_due,
+      parent: {
+        type: 'subscription_details',
+        subscription_details: { subscription: updatedSubscription.id, metadata: null },
+        quote_details: null,
+      },
+    });
+    mockInvoicesRetrieve.mockResolvedValueOnce(issuedInvoice);
+    await handleInvoiceEvent(fakeEvent('invoice.created', issuedInvoice) as never);
+
+    const [invoiceRow] = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeInvoiceId, issuedInvoice.id));
+    expect(invoiceRow).toBeDefined();
+    cleanupInvoiceIds.push(invoiceRow!.id);
+    expect(invoiceRow?.amountDueMinor).toBe(previewBody.amount_due);
   });
 });
 

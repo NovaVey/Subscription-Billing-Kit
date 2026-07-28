@@ -10,5 +10,12 @@ export default defineConfig({
     // would let one file's rows (e.g. the reaper test's "processing" rows)
     // leak into another's queries against the same tables.
     fileParallelism: false,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'text-summary', 'json-summary'],
+      reportsDirectory: './coverage/integration',
+      include: ['src/**/*.ts'],
+      exclude: ['src/db/migrations/**', 'src/index.ts'],
+    },
   },
 });
