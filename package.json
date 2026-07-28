@@ -9,14 +9,17 @@
     "node": ">=20"
   },
   "workspaces": [
-    "api"
+    "api",
+    "web"
   ],
   "scripts": {
     "dev": "npm run dev --workspace=api",
+    "dev:web": "npm run dev --workspace=web",
     "build": "npm run build --workspace=api",
+    "build:web": "npm run build --workspace=web",
     "start": "npm run start --workspace=api",
-    "lint": "eslint scripts --max-warnings=0 && npm run lint --workspace=api",
-    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck --workspace=api",
+    "lint": "eslint scripts --max-warnings=0 && npm run lint --workspace=api && npm run lint --workspace=web",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck --workspace=api && npm run typecheck --workspace=web",
     "test:unit": "npm run test:unit --workspace=api",
     "test:integration": "npm run test:integration --workspace=api",
     "db:generate": "npm run db:generate --workspace=api",

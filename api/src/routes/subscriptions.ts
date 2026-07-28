@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNull, lt, or } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 import { z } from 'zod';
@@ -6,9 +6,47 @@ import { stripe } from '../stripe/client.js';
 import { subscriptionCancelKey, subscriptionPlanChangeKey, subscriptionResumeKey } from '../stripe/idempotency.js';
 import { syncSubscriptionFromStripe } from '../stripe/sync.js';
 import { db } from '../db/client.js';
-import { invoices, subscriptionEvents, subscriptionItems, subscriptions } from '../db/schema.js';
+import { customers, dunningState, invoices, subscriptionEvents, subscriptionItems, subscriptions } from '../db/schema.js';
 
 const ProrationBehavior = z.enum(['create_prorations', 'none', 'always_invoice']);
+
+const ListQuery = z.object({
+  status: z.string().optional(),
+  q: z.string().optional(),
+  cursor: z.iso.datetime().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+// MRR is a display-only derived metric, not a currency-decimal conversion
+// - money.ts's "nothing outside it divides by 100" rule is about the
+// zero-decimal-currency bug, not about normalizing a yearly/weekly/daily
+// price to a monthly-equivalent figure. Interval count (e.g. "every 3
+// months") isn't stored on subscription_items (a pre-existing gap from
+// Phase 3, out of scope here), so this assumes interval_count=1.
+function computeMrrMinor(
+  items: readonly { unitAmountMinor: number; quantity: number; recurringInterval: string | null }[],
+): number {
+  let total = 0;
+  for (const item of items) {
+    const base = item.unitAmountMinor * item.quantity;
+    switch (item.recurringInterval) {
+      case 'year':
+        total += base / 12;
+        break;
+      case 'week':
+        total += base * (52 / 12);
+        break;
+      case 'day':
+        total += base * (365 / 12);
+        break;
+      case 'month':
+      default:
+        total += base;
+        break;
+    }
+  }
+  return Math.round(total);
+}
 
 const PlanChangeBody = z.object({
   price_id: z.string().min(1),
@@ -72,6 +110,75 @@ async function resyncAfterMutation(
 }
 
 export async function subscriptionRoutes(app: FastifyInstance) {
+  // ?status=&q=&cursor= (§6) - q searches the customer's email or
+  // external_ref. Cursor is the createdAt of the last row on the previous
+  // page (keyset pagination) - simple and sufficient at this tool's scale,
+  // not an offset that drifts as rows are inserted between page loads.
+  app.get('/subscriptions', async (req, reply) => {
+    const parsed = ListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
+    }
+    const { status, q, cursor, limit } = parsed.data;
+
+    const conditions = [];
+    if (status) conditions.push(eq(subscriptions.status, status));
+    if (cursor) conditions.push(lt(subscriptions.createdAt, new Date(cursor)));
+    if (q) conditions.push(or(ilike(customers.email, `%${q}%`), ilike(customers.externalRef, `%${q}%`)));
+
+    const rows = await db
+      .select({
+        id: subscriptions.id,
+        status: subscriptions.status,
+        planCode: subscriptions.planCode,
+        currency: subscriptions.currency,
+        nextPeriodEndDerived: subscriptions.nextPeriodEndDerived,
+        createdAt: subscriptions.createdAt,
+        customerEmail: customers.email,
+        customerExternalRef: customers.externalRef,
+        dunningStage: dunningState.stage,
+      })
+      .from(subscriptions)
+      .innerJoin(customers, eq(customers.id, subscriptions.customerId))
+      .leftJoin(dunningState, eq(dunningState.subscriptionId, subscriptions.id))
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(subscriptions.createdAt))
+      .limit(limit + 1);
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    const subIds = page.map((row) => row.id);
+    const itemRows =
+      subIds.length > 0
+        ? await db
+            .select()
+            .from(subscriptionItems)
+            .where(and(inArray(subscriptionItems.subscriptionId, subIds), isNull(subscriptionItems.removedAt)))
+        : [];
+    const itemsBySubscription = new Map<string, typeof itemRows>();
+    for (const item of itemRows) {
+      const list = itemsBySubscription.get(item.subscriptionId) ?? [];
+      list.push(item);
+      itemsBySubscription.set(item.subscriptionId, list);
+    }
+
+    return reply.send({
+      subscriptions: page.map((row) => ({
+        id: row.id,
+        status: row.status,
+        planCode: row.planCode,
+        currency: row.currency,
+        mrrMinor: computeMrrMinor(itemsBySubscription.get(row.id) ?? []),
+        nextPeriodEndDerived: row.nextPeriodEndDerived,
+        dunningStage: row.dunningStage ?? 0,
+        customerEmail: row.customerEmail,
+        customerExternalRef: row.customerExternalRef,
+      })),
+      nextCursor: hasMore ? page[page.length - 1]!.createdAt.toISOString() : null,
+    });
+  });
+
   app.get('/subscriptions/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
 
@@ -79,6 +186,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
     if (!subRow) {
       return reply.code(404).send({ error: 'subscription not found' });
     }
+    const [customerRow] = await db.select().from(customers).where(eq(customers.id, subRow.customerId));
 
     const items = await db
       .select()
@@ -94,8 +202,16 @@ export async function subscriptionRoutes(app: FastifyInstance) {
       .from(invoices)
       .where(eq(invoices.subscriptionId, id))
       .orderBy(desc(invoices.periodStart));
+    const [dunningRow] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, id));
 
-    return reply.send({ subscription: subRow, items, timeline, invoices: invoiceRows });
+    return reply.send({
+      subscription: subRow,
+      customer: customerRow ?? null,
+      items,
+      timeline,
+      invoices: invoiceRows,
+      dunning: dunningRow ?? null,
+    });
   });
 
   app.get('/subscriptions/:id/preview', async (req, reply) => {

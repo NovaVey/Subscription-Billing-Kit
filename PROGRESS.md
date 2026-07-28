@@ -352,3 +352,39 @@ Run from the same machine as the dunning engine's live test-clock verification (
 2. A dedicated demo Postgres exists: the user added it via the Railway dashboard's "Add PostgreSQL" flow (a proper managed volume, `RAILWAY_VOLUME_ID` confirmed present - not a bare-image container, which would lose data on every redeploy). Its internal `DATABASE_URL` (`postgres-zrmr.railway.internal`) was wired into the Subscription-Billing-Kit service via Railway's API. The resulting redeploy's logs confirm `migrations applied` and a clean boot against the new, empty database - all ten tables created fresh, no data carried over from the old shared "Postgres" service (by design: the old one is still shared with unrelated other projects in "Upwork Portfolio" and was never meant to be this kit's dedicated store).
 
 **No open items remain from Phases 0-6.** The one thing worth noting for Phase 9: the demo database is currently empty (fresh schema, no seeded customers/subscriptions/invoices) - seeding it with realistic demo data is explicitly Phase 9's job ("deployed demo on Railway with seeded data"), not done here.
+
+## Phase 7 — Admin UI
+
+**Date:** 2026-07-28
+
+**Status:** Code complete, all four backend endpoint gaps filled and tested, all six §7 screens built and wired to the real API, verified end to end locally. This phase has an explicit CHECKPOINT (screenshots of subscriptions list, subscription detail, dunning queue) - reported below, awaiting reply before Phase 8.
+
+**Backend files touched (filling §6 gaps that predate this phase):**
+- `api/src/routes/subscriptions.ts` — added `GET /subscriptions` (list: `status`/`q`/`cursor`/`limit`, keyset pagination, per-row MRR computed from non-removed items, joined customer + dunning stage); added the joined `customer` row and `dunning` state to the existing `GET /subscriptions/:id` (both were pre-existing §6 gaps, not new scope - see D-032)
+- `api/src/routes/invoices.ts` (new) — `GET /invoices` (`customer_id`/`status`/`limit`, joined customer email)
+- `api/src/routes/webhookEvents.ts` (new) — `GET /admin/webhook-events` (`status`/`type`/`limit`), `POST /admin/webhook-events/:id/replay` (resets a row to a clean `received` state - `attempts`, `next_attempt_at`, `processing_started_at`, `processed_at`, `last_error` all cleared)
+- `api/src/app.ts` — registered both new route files; added `@fastify/cors` scoped to `env.APP_BASE_URL` (D-029) - a gap that only surfaced once a browser, not `curl` or a test, actually called the API cross-origin
+- `api/test/integration/adminEndpoints.test.ts` (new) — 13 tests covering all four endpoints plus the customer/dunning additions to `GET /subscriptions/:id`
+
+**Frontend: `/web` scaffolded fresh (Vite + React + TypeScript + Tailwind + react-router-dom, D-031):**
+- `web/src/index.css` — §7's exact design tokens (`paper #FBFAF7`, `ink #14161A`, `rule #DFDCD4`, `alert #B4501E`, `settled #2F6B4F`; a `.num` tabular-nums monospace utility every amount/id/timestamp routes through); `prefers-reduced-motion` respected; visible focus rings
+- `web/src/lib/money.ts`, `web/src/lib/format.ts` — frontend's own money/timestamp formatting, mirroring the API's zero-decimal discipline and the timeline's bank-statement timestamp shape rather than importing the API's module directly (D-030)
+- `web/src/lib/api.ts`, `web/src/lib/types.ts` — typed fetch client and response shapes for every §6 endpoint the UI calls
+- `web/src/components/` — `Layout` (nav across the six screens), `StatusTag` (short word + colored left rule, never a pill), `Amount`, `Modal`, `Toast` (buttons name the action, the toast repeats that word), `States` (empty/error/loading)
+- `web/src/pages/` — all six screens: `SubscriptionsListPage`, `SubscriptionDetailPage` (header facts, per-item periods, the event timeline as the signature element, invoice list, cancel/resume/change-plan-with-proration-preview-modal), `DunningQueuePage` (grouped by stage, manual resolve modal), `InvoicesPage`, `WebhookLogPage` (expandable payload, replay), `ReconciliationPage` (run history, on-demand run, drill-in to the field-level diff table)
+- Root `package.json`/`eslint.config.js` updated to add `web` as a third workspace, with its own `eslint.config.js` matching `api`'s pattern (replacing the Vite template's default `oxlint`, for one lint tool across the whole repo)
+
+**Decisions made (D-029 through D-032, full detail in `docs/DECISIONS.md`):**
+- CORS is scoped to `APP_BASE_URL` specifically, not a wildcard or a new env var - that config value already names the one origin meant to call these endpoints. See D-029.
+- The frontend keeps its own small `money.ts`/`format.ts` rather than a shared package, since §3's repo layout doesn't define one and the frontend only ever needs the display direction of the API's money logic. See D-030.
+- `react-router-dom` chosen via an explicit question, since §2 names the rest of the stack but not a router. See D-031.
+- `GET /subscriptions/:id`'s new `customer` field is a pre-existing gap being filled, not new scope - the same category as the `dunning` field it was already missing before this phase. See D-032.
+
+**How the exit criteria were verified:**
+- `npm run typecheck` / `npm run lint` clean across all three workspaces (root, `api`, `web`).
+- `api`: 50/50 integration tests, 53/53 unit tests green (13 of the integration tests are new, covering the four filled endpoint gaps).
+- Both apps booted locally and exercised with real HTTP traffic end to end - not just unit tests. This sandbox still has no route to the real demo Postgres on Railway or to `api.stripe.com` (unchanged since Phase 0), so verification used the local dev Postgres (`billing_kit_test`), seeded with three representative subscriptions (a EUR trial, an active USD plan, and a USD plan mid-dunning-cycle with a real past-due invoice) via a throwaway script that was deleted afterward along with the rows it created - nothing from this walkthrough is in the repo or the committed history.
+- This local walkthrough is what caught the CORS gap (D-029): the first attempt to load the subscriptions list from the browser failed with "Failed to fetch," which turned out to be the browser correctly blocking a cross-origin request with no `Access-Control-Allow-Origin` header - not a frontend bug. Fixed, then reverified.
+- Playwright (pre-installed in this environment) drove the running app and captured all six screens, plus the dunning-resolve modal, the webhook payload expand/collapse toggle, and a 390px-wide mobile view of the subscriptions list, to confirm interactivity and responsiveness beyond a static screenshot. The three CHECKPOINT screens are attached to this report.
+
+**Open items carried forward:** none new. The existing standing item - seeding the real deployed demo database - is still explicitly Phase 9's job, not this one.
