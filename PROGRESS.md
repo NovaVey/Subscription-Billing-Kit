@@ -336,7 +336,8 @@ Two real findings surfaced along the way, both now resolved:
 - A unit test proves totals alone would hide the case §5.11 calls out by name: a missing invoice and an orphan invoice of equal value net to equal totals on both sides, while the detailed report still reports both.
 - 5/5 new integration tests, 37/37 integration tests total, 53/53 unit tests (7 new: 5 classification, 2 TZ-window), clean typecheck/lint/build. A live boot check confirmed both new routes respond correctly, including Zod's per-field validation errors on a malformed `POST /admin/reconciliation/run` body.
 
-**Open items carried forward, unchanged:**
+**Open items carried forward:**
 1. A separate demo Postgres database is still needed before Phase 9.
-2. The inert first Railway domain is still there, still harmless, still needs a manual dashboard deletion.
-3. `scripts/reconcile-nightly.ts` is written and unit/integration-tested against mocks and the local Postgres, but - like the dunning tick before its later live verification - has not yet been run against the real Railway deployment's actual invoice history. A future session with real network access could verify it the same way the dunning engine's live test-clock run was verified.
+2. `scripts/reconcile-nightly.ts` is written and unit/integration-tested against mocks and the local Postgres, but - like the dunning tick before its later live verification - has not yet been run against the real Railway deployment's actual invoice history. A future session with real network access could verify it the same way the dunning engine's live test-clock run was verified.
+
+**Resolved:** the inert first Railway domain (`subscription-billing-kit-production.up.railway.app`, no working target port) was manually deleted from the Railway dashboard. Confirmed via `railway_list_domains`: only `subscription-billing-kit-production-0f5e.up.railway.app` (`targetPort: 3000`, the one actually wired to the live Stripe webhook endpoint) remains.
