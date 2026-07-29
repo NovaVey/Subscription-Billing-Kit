@@ -40,6 +40,7 @@ const { fakeCustomer, fakeEvent, fakeInvoice, fakeSubscription, fakeSubscription
 const { createCheckoutSession } = await import('../../src/stripe/checkout.js');
 const { processPendingWebhookEvents } = await import('../../src/webhooks/processor.js');
 const { handleInvoiceEvent } = await import('../../src/webhooks/handlers/invoice.js');
+const { WRITE_KEY_HEADERS } = await import('./helpers/adminAuth.js');
 
 const app = buildApp();
 
@@ -301,6 +302,7 @@ describe('plan change preview matches the invoice Stripe actually issues', () =>
     const previewResponse = await app.inject({
       method: 'GET',
       url: `/subscriptions/${subRow.id}/preview?price_id=price_pro_monthly&quantity=1`,
+      headers: WRITE_KEY_HEADERS,
     });
     expect(previewResponse.statusCode).toBe(200);
     const previewBody = previewResponse.json();
@@ -322,6 +324,7 @@ describe('plan change preview matches the invoice Stripe actually issues', () =>
       method: 'POST',
       url: `/subscriptions/${subRow.id}/plan`,
       payload: { price_id: 'price_pro_monthly', quantity: 1, proration_behavior: 'create_prorations' },
+      headers: WRITE_KEY_HEADERS,
     });
     expect(applyResponse.statusCode).toBe(200);
 
@@ -375,6 +378,7 @@ describe('cancel and resume write a manual audit row even when status does not c
       method: 'POST',
       url: `/subscriptions/${subRow.id}/cancel`,
       payload: { at_period_end: true },
+      headers: WRITE_KEY_HEADERS,
     });
     expect(response.statusCode).toBe(200);
     expect(response.json().status).toBe('active');
@@ -410,7 +414,11 @@ describe('cancel and resume write a manual audit row even when status does not c
       }),
     );
 
-    const response = await app.inject({ method: 'POST', url: `/subscriptions/${subRow.id}/resume` });
+    const response = await app.inject({
+      method: 'POST',
+      url: `/subscriptions/${subRow.id}/resume`,
+      headers: WRITE_KEY_HEADERS,
+    });
     expect(response.statusCode).toBe(200);
 
     const [updatedRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, subRow.id));
@@ -425,7 +433,11 @@ describe('cancel and resume write a manual audit row even when status does not c
 
   it('returns 409 when there is nothing to resume', async () => {
     const { subRow } = await seedCustomerAndSubscription();
-    const response = await app.inject({ method: 'POST', url: `/subscriptions/${subRow.id}/resume` });
+    const response = await app.inject({
+      method: 'POST',
+      url: `/subscriptions/${subRow.id}/resume`,
+      headers: WRITE_KEY_HEADERS,
+    });
     expect(response.statusCode).toBe(409);
   });
 });

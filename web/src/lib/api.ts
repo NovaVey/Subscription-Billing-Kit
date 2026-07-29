@@ -7,6 +7,7 @@ import type {
   SubscriptionListResponse,
   WebhookEventListResponse,
 } from './types';
+import { clearAdminKey, getAdminKey } from './adminKey';
 
 // API_BASE_URL is the server's own env var name (§2); VITE_ prefixes are
 // how Vite exposes build-time env vars to client code, so this is that
@@ -25,10 +26,29 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const adminKey = getAdminKey();
   const response = await fetch(`${BASE_URL}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(adminKey ? { Authorization: `Bearer ${adminKey}` } : {}),
+      ...init?.headers,
+    },
   });
+  if (response.status === 401) {
+    // The stored key is missing or wrong (Phase 10) - clear it and reload so
+    // AdminGate reprompts, rather than surfacing a confusing "unauthorized"
+    // toast on whatever page happened to be open. The reload normally tears
+    // down this whole page within milliseconds, but if something ever blocks
+    // it (an embedding iframe, a beforeunload handler), this promise must
+    // still eventually settle - otherwise every caller's `finally` (button
+    // busy-state, loading spinners) would stay stuck forever with no way out.
+    clearAdminKey();
+    window.location.reload();
+    return new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new ApiError(401, 'admin key was rejected; reloading')), 5000);
+    });
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new ApiError(response.status, body.error ?? `request failed (${response.status})`, body.details);

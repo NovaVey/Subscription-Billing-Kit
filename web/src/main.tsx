@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createBrowserRouter, Navigate, RouterProvider } from 'react-router-dom';
 import './index.css';
+import { AdminGate } from './components/AdminGate';
 import { Layout } from './components/Layout';
 import { ToastProvider } from './components/Toast';
 import { SubscriptionsListPage } from './pages/SubscriptionsListPage';
@@ -29,8 +30,10 @@ const router = createBrowserRouter([
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <ToastProvider>
-      <RouterProvider router={router} />
-    </ToastProvider>
+    <AdminGate>
+      <ToastProvider>
+        <RouterProvider router={router} />
+      </ToastProvider>
+    </AdminGate>
   </StrictMode>,
 );

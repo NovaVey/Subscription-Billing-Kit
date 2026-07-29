@@ -5,6 +5,8 @@ const validEnv = {
   DATABASE_URL: 'postgres://user:pass@localhost:5432/billing',
   STRIPE_SECRET_KEY: 'sk_test_abc123',
   STRIPE_API_VERSION: '2025-03-31.basil',
+  ADMIN_API_KEY: 'test-write-key',
+  ADMIN_READONLY_KEY: 'test-readonly-key',
 };
 
 describe('EnvSchema', () => {
@@ -52,6 +54,14 @@ describe('EnvSchema', () => {
     if (result.success) {
       expect(result.data.WEBHOOK_LEASE_SECONDS).toBe(300);
       expect(result.data.RECONCILE_TZ).toBe('UTC');
+    }
+  });
+
+  it('rejects ADMIN_API_KEY and ADMIN_READONLY_KEY being set to the same value', () => {
+    const result = EnvSchema.safeParse({ ...validEnv, ADMIN_READONLY_KEY: validEnv.ADMIN_API_KEY });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.path.join('.'))).toContain('ADMIN_READONLY_KEY');
     }
   });
 });

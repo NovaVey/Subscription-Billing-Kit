@@ -16,6 +16,8 @@ Operational reference for running this service — local dev, deploying, and the
 | `DUNNING_ENABLED` | Optional (defaults `true`) | Gates the in-process 15-minute dunning tick (dev). Set `false` to disable it without redeploying — e.g. if `scripts/dunning-tick.ts` is scheduled externally instead. |
 | `WEBHOOK_LEASE_SECONDS` | Optional (defaults `300`) | How long a claimed `processing` row can stay claimed before the reaper reclaims it. |
 | `RECONCILE_TZ` | Optional (defaults `UTC`) | The timezone `computeYesterdayWindow()` bounds the nightly reconciliation window in. |
+| `ADMIN_API_KEY` | Yes | Full read+write access to every admin route (subscriptions, invoices, dunning, reconciliation, webhook-events admin endpoints). Generate a long random string; never reuse across environments. See `docs/DECISIONS.md` D-033. |
+| `ADMIN_READONLY_KEY` | Yes | Same routes, GET only - any mutating call with this key gets a 403. Neither key gates `/customers`, `/checkout/sessions`, `/portal/sessions`, or `/webhooks/stripe`, which stay open to the storefront/Stripe respectively. |
 
 ## First-time local setup
 
@@ -29,6 +31,8 @@ npm run dev                 # API on API_BASE_URL (default :3000)
 npm run dev:web             # admin UI on :5173, separate terminal
 stripe listen --forward-to localhost:3000/webhooks/stripe
 ```
+
+Opening the admin UI for the first time in a tab prompts for an admin key - paste `ADMIN_API_KEY` for full access or `ADMIN_READONLY_KEY` to browse without being able to mutate anything. It's held in that tab's `sessionStorage`, not saved anywhere else, and clears when the tab closes.
 
 `stripe listen` prints its own `whsec_...` — that's the value for `STRIPE_WEBHOOK_SECRET` **locally only**. Keep reading before reusing it anywhere else.
 

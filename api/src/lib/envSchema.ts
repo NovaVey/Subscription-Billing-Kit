@@ -33,6 +33,24 @@ export const EnvSchema = z.object({
     .transform((v) => v === 'true'),
   WEBHOOK_LEASE_SECONDS: z.coerce.number().int().positive().default(300),
   RECONCILE_TZ: z.string().default('UTC'),
+  // Shared-secret admin access control (Phase 10) - gates every admin route
+  // (subscriptions, invoices, dunning, reconciliation, webhook-events admin
+  // endpoints) but never the public customer/checkout/portal routes or the
+  // webhook receiver itself, which Stripe's own signature already verifies.
+  // See docs/DECISIONS.md D-033 for why shared keys rather than user accounts.
+  ADMIN_API_KEY: z.string().min(1, 'ADMIN_API_KEY is required'),
+  ADMIN_READONLY_KEY: z.string().min(1, 'ADMIN_READONLY_KEY is required'),
+}).superRefine((v, ctx) => {
+  // resolveAdminRole() checks the write key first - if an operator ever set
+  // both to the same value (a copy-paste mistake), the "read-only" key would
+  // silently resolve to full write access. Fail boot loudly instead.
+  if (v.ADMIN_API_KEY === v.ADMIN_READONLY_KEY) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['ADMIN_READONLY_KEY'],
+      message: 'ADMIN_READONLY_KEY must differ from ADMIN_API_KEY',
+    });
+  }
 });
 
 export type Env = z.infer<typeof EnvSchema>;
