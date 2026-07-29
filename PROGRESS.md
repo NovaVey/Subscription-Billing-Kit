@@ -423,3 +423,45 @@ This phase's actual job wasn't writing new tests from scratch - almost all of §
 **Verification:** typecheck/lint clean across all three workspaces; 53/53 unit tests (up from 53 - no new unit tests, one strengthened), 62/62 integration tests (up from 50: 9 dunning/reconciliation route tests + 2 health tests + 1 retry-idempotency test); unit suite runs in ~1.5s, comfortably under the 30s budget. Coverage: unit-only 15.84% lines (expected - routes/handlers/webhooks are integration-tested by design), integration-only 79.07% lines (up from 73.07% before this phase's route-coverage fixes).
 
 **Open items carried forward:** none. The double-submit gap documented in `docs/ARCHITECTURE.md` above is a known, accepted product limitation flagged for a future decision, not a bug to silently fix in this phase.
+
+## Phase 9 — Docs, demo, packaging
+
+**Date:** 2026-07-29
+
+**Status:** Complete. All four docs written, the demo script and the previously-missing `replay-event.ts` script both built and verified, and every doc/script adversarially fact-checked with every real finding fixed. Two exit-criteria items are explicitly, transparently unresolved by mutual agreement with the client (see "Open items" below) rather than silently skipped or faked.
+
+This phase's job was turning four phases of working code into something a client can actually evaluate and run: a state-machine reference, an operational runbook, a packaging/pitch doc, a README that leads with the failure modes closed rather than the stack used, and an unattended demo that proves the full trial-to-recovery arc without anyone waiting on real calendar days.
+
+**Docs written:**
+- `docs/STATE-MACHINE.md` — the 8 statuses, the "expected vs. allowed" philosophy (Stripe is always the source of truth; an unexpected transition is still applied, just logged and flagged, never rejected), the full transition table, the `forceRecord` audit-row guarantee, and how a webhook actually reaches the table (`handleSubscriptionEvent` as the single dispatch point).
+- `docs/RUNBOOK.md` — env var reference, first-time local setup, deploying, the two webhook gotchas required verbatim by §9 (wrong signing secret; mismatched per-endpoint API version), a crons-vs-in-process-ticks table, three ways to replay a failed webhook, a troubleshooting table, and Windows notes.
+- `docs/DELIVERY.md` — the client-facing packaging doc per §12's template: Acceptance leading (as the spec instructs — "that's the whole pitch"), Deliverables, a 2-3 week Timeline, What I need from you, Out of scope.
+- `README.md` — full rewrite per §11: opens with the failure-mode framing, a 14-row failure-mode table (every row linking to the real test file that proves it), a Screenshots section (6 images copied into `docs/screenshots/` from the Phase 7 checkpoint captures), Non-goals, Setup, Testing (retained from Phase 8), Stack deliberately last ("nobody hires on stack"), Repo layout.
+
+**Scripts built:**
+- `scripts/test-clock-demo.ts` — the unattended full-arc demo (trial → renewal → failed payment → dunning stage 3 → recovery) §5.12/§9 call for. The key design point: it calls the exact same `runDunningTick(now)` production code the real cron calls, just supplying an advancing simulated `now` instead of real wall-clock time — the same compression principle as Stripe's own test clocks, applied to the dunning side that Stripe's test clocks can't reach. Every webhook a real deployment would receive is instead delivered through a `deliverEvent()` helper that inserts a genuine `webhook_events` ledger row before calling the same handler functions the real receiver dispatches to (`handleCustomerEvent`/`handleSubscriptionEvent`/`handleInvoiceEvent`), so nothing about the handler code path differs from production.
+- `scripts/replay-event.ts` — a genuine gap: §3's repo layout named this file but it was never built in any prior phase (the HTTP route did the same job, but never as a standalone script). Mirrors `routes/webhookEvents.ts`'s replay logic exactly. Smoke-tested against the local test database: inserted a fake failed row, ran the script, confirmed it reset to `received` with attempts/backoff/lease cleared.
+
+**Adversarial fact-check (workflow, 4 parallel agents — one per new/rewritten doc, one over both scripts):**
+- README: the zero-decimal-currency row overclaimed that `money.ts` is "the only place any amount is scaled; nothing else divides or multiplies by 100" — false, since `web/src/lib/money.ts` is a deliberate, D-030-documented display-only mirror that does its own `/100`. Fixed by scoping the claim to the API/backend and pointing to D-030.
+- RUNBOOK: five env vars with Zod `.default()` values (`APP_BASE_URL`, `API_BASE_URL`, `DUNNING_ENABLED`, `WEBHOOK_LEASE_SECONDS`, `RECONCILE_TZ`) were labelled "Yes" (required) instead of "Optional (defaults to X)". Fixed. Also fixed: "`npm run build` compiles both" (it only compiles the API — `build:web` is separate); the replay route's param documented as `:stripe_event_id` when the actual Fastify param is `:id`; and a self-contradiction where the gotchas intro claimed both "fail the exact same way: a silent 400" while the Troubleshooting table (correctly) distinguishes gotcha #2 as a 200-with-corrupted-fields failure — reworded the intro to match the table.
+- STATE-MACHINE: the closing citation credited D-001/D-002/D-020 for the transition table, staleness guard, and audit-row content — D-001 (API version pinning) and D-002 (periods on items) are unrelated Phase 0/1 decisions. Corrected to D-006 (re-fetch truth), D-017 (staleness guard), D-020 (`forceRecord`), verified each against `docs/DECISIONS.md` to actually match.
+- `test-clock-demo.ts` — three real bugs, all would have surfaced only on an actual run:
+  1. **FK violation on first real run.** `subscription_events.stripe_event_id` has a real foreign key to `webhook_events.stripe_event_id`; the original draft called handlers with a synthetic event object that was never backed by a ledger row, so the first recorded transition with a non-null `stripeEventId` would crash. Fixed by introducing `deliverEvent()`, which inserts the ledger row first.
+  2. **Cleanup gap.** The dunning arc creates `dunning_notices` rows (a real FK to `subscriptions.id`), but the teardown block never deleted them before deleting `subscriptions` — would fail the FK constraint and silently leak rows on every re-run. Fixed by adding the delete, first, in FK order.
+  3. **Late id capture.** `localSubscriptionId`/`localCustomerId` were only assigned after the payment-failure section succeeded, so an earlier thrown error (a real risk given test-clock timing) would leave cleanup unable to find what to clean up. Fixed by capturing both ids immediately after `customer.subscription.created` is delivered.
+
+**Files touched:**
+- `docs/STATE-MACHINE.md`, `docs/RUNBOOK.md`, `docs/DELIVERY.md` (new)
+- `README.md` (full rewrite)
+- `docs/screenshots/*.png` (6 new files, copied from the Phase 7 checkpoint captures so the README's links resolve to real committed images)
+- `scripts/test-clock-demo.ts`, `scripts/replay-event.ts` (new)
+- `package.json` (root) — added the `replay-event` script
+
+**Verification:** typecheck and lint clean across all three workspaces after the `test-clock-demo.ts` fixes; 53/53 unit tests, 62/62 integration tests, both suites still green with no regressions from this phase's changes (no test files were touched — this phase only added docs and standalone scripts outside the test tree).
+
+**Open items — both explicitly raised and, per the client's own choice, deferred rather than built or worked around:**
+- **Seeding the live deployed demo (Railway + Stripe).** This sandbox has no path to run `test-clock-demo.ts` against the actual deployed environment: no raw network route to `api.stripe.com` or the deployed Railway Postgres, Railway's MCP tools expose no SQL-execution capability for a non-Supabase Postgres service, and the Stripe MCP's generic API tools don't expose the `/v1/test_helpers/*` test-clock namespace at all. The script itself is built, smoke-testable, and ready to run from any machine with real network access to both services — it just can't be executed from here. Presented via `AskUserQuestion`; the client chose to skip it for now rather than have new workaround scope built.
+- **Read-only admin access control.** The admin UI currently has no authentication/authorization layer distinguishing read-only from full-access users. This was never in any prior phase's scope and would be new, undiscussed work. Presented alongside the item above; the client chose to skip it for now.
+
+Both remain here as disclosed, known gaps for whoever picks this up next — not silently absent.
