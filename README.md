@@ -91,7 +91,7 @@ Node 20 + TypeScript (strict), Fastify, Zod, Postgres via `pg` and Drizzle, Stri
 /api       Fastify service — db/, stripe/, webhooks/, billing/, routes/, lib/
 /web       React admin UI (Phase 7)
 /docs      ARCHITECTURE, DECISIONS, RUNBOOK, STATE-MACHINE, DELIVERY, screenshots
-/scripts   seed-catalog, dunning-tick, reconcile-nightly, test-clock, test-clock-demo, replay-event
+/scripts   seed-catalog, dunning-tick, reconcile-nightly, test-clock, test-clock-demo, replay-event, smoke-test
 PROGRESS.md   phase-by-phase build log and decision history
 ```
 

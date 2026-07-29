@@ -44,6 +44,14 @@ If you're on Railway specifically: a service domain created without an explicit 
 
 **Before merging a change that adds a new required env var, set it on every already-deployed environment first, not just in `.env.example`.** A fresh deploy naturally gets it from whoever fills out `.env.example`; an existing deployment doesn't pick up a new required var on its own and will crash on the very next boot with `Invalid environment configuration` (this happened for real when Phase 10 added `ADMIN_API_KEY`/`ADMIN_READONLY_KEY` — the deployed Railway service crashed until both were set on it directly). `npm start`'s migrate-then-serve boot sequence means the process won't even get to `/health` if `env.ts`'s validation fails.
 
+**After every deploy, run the smoke test against it** — this is exactly what would have caught the incident above automatically instead of by accident:
+
+```
+npm run smoke-test -- --base-url https://your-deployed-url
+```
+
+(`scripts/smoke-test.ts`, needs `ADMIN_API_KEY`/`ADMIN_READONLY_KEY` for the target environment, as env vars or `--write-key`/`--readonly-key`.) It's a real HTTP client hitting a running instance — a different thing than `npm run test:integration`, which proves business logic against a real database with a *mocked* Stripe client. The smoke test proves the actual deployed wiring: every route reachable, the admin auth gate enforced correctly on all of them, and whatever `/health` reports about Stripe connectivity. It runs in two tiers: everything that doesn't require a live Stripe call always runs (route auth, input validation, 404-before-any-Stripe-call checks, listing endpoints); one genuine round trip through Stripe (create a customer, confirm a repeat call with the same reference is idempotent) only runs where `/health` reports Stripe reachable — reporting SKIPPED rather than a false failure when run somewhere without Stripe network access, like this sandbox. That one Tier 2 check has no teardown (there's no delete route anywhere in this API), so the first run against any given target permanently creates one real Stripe customer and one local row — accepted, since re-running is safe by design (that's the idempotency being proved), but worth knowing before running it against a target you care about staying pristine.
+
 ## The two gotchas that will cost you an afternoon if you miss them
 
 Neither one crashes anything, and `/health` still reports green — the app looks fine either way. Gotcha #1 fails loudly-but-invisibly-to-you: a silent 400 on every webhook delivery, visible only in Stripe's dashboard as a string of failed attempts. Gotcha #2 is quieter still: deliveries return 200, but with fields silently wrong or missing on the received payload — see the Troubleshooting table below for how to tell them apart.

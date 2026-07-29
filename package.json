@@ -27,6 +27,7 @@
     "seed:catalog": "tsx scripts/seed-catalog.ts",
     "dunning:tick": "tsx scripts/dunning-tick.ts",
     "reconcile:nightly": "tsx scripts/reconcile-nightly.ts",
-    "replay-event": "tsx scripts/replay-event.ts"
+    "replay-event": "tsx scripts/replay-event.ts",
+    "smoke-test": "tsx scripts/smoke-test.ts"
   }
 }
