@@ -37,6 +37,8 @@ jobs:
       STRIPE_SECRET_KEY: sk_test_ci_placeholder_not_a_real_key
       STRIPE_API_VERSION: 2026-06-24.dahlia
       STRIPE_WEBHOOK_SECRET: whsec_ci_placeholder_not_a_real_secret
+      ADMIN_API_KEY: ci_placeholder_admin_write_key_not_a_real_secret
+      ADMIN_READONLY_KEY: ci_placeholder_admin_readonly_key_not_a_real_secret
 
     steps:
       - uses: actions/checkout@v4

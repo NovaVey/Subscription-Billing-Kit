@@ -57,6 +57,8 @@ stripe listen --forward-to localhost:3000/webhooks/stripe
 
 `GET /health` reports Postgres connectivity, Stripe connectivity, and the pinned Stripe API version. See `docs/RUNBOOK.md` for deploying, the two webhook gotchas that cost the most time on any Stripe integration, and day-to-day operations (crons, replaying a failed event).
 
+Every admin route requires a key (`ADMIN_API_KEY` for full access, `ADMIN_READONLY_KEY` for browse-only) — the admin UI prompts for one on first load. See `docs/DECISIONS.md` D-033.
+
 ## Testing
 
 ```
@@ -68,14 +70,14 @@ npm run test:integration:coverage --workspace=api
 
 Every test is named after the specific failure it prevents (see the table above and the test files themselves) — 19 integration + 6 unit tests are named directly in the project brief's §9, plus additional tests covering the admin API surface, the admin UI's supporting routes, and `/health`.
 
-**115 tests, both suites green:** 53 unit (~1.5s) + 62 integration (~12s).
+**183 tests, both suites green:** 63 unit (~1.5s) + 120 integration (~13s).
 
-Coverage below is `%Lines` from `@vitest/coverage-v8`, run separately per suite since they exercise different layers on purpose — unit tests cover pure logic in isolation (`money.ts`, `time.ts`, `stateMachine.ts`, `idempotency.ts`, `reconcile.ts`'s classifier), while routes, webhook handlers, and the processor/reaper are deliberately only exercised through the integration suite against a real database, per the test-plan split in `docs/ARCHITECTURE.md`. Reading the unit number on its own understates coverage for exactly that reason — the two numbers answer different questions, not the same question twice.
+Coverage below is `%Lines` from `@vitest/coverage-v8`, run separately per suite since they exercise different layers on purpose — unit tests cover pure logic in isolation (`money.ts`, `time.ts`, `stateMachine.ts`, `idempotency.ts`, `reconcile.ts`'s classifier, `adminAuth.ts`'s role resolution), while routes, webhook handlers, and the processor/reaper are deliberately only exercised through the integration suite against a real database, per the test-plan split in `docs/ARCHITECTURE.md`. Reading the unit number on its own understates coverage for exactly that reason — the two numbers answer different questions, not the same question twice.
 
 | Suite | Statements | Branches | Functions | Lines |
 |---|---|---|---|---|
-| Unit only | 15.78% | 11.04% | 26.42% | 15.84% |
-| Integration only | 78.31% | 65.46% | 77.14% | 79.07% |
+| Unit only | 17.66% | 13.19% | 27.58% | 17.43% |
+| Integration only | 80.62% | 69.92% | 78.62% | 81.37% |
 
 The remaining uncovered lines are almost entirely process bootstrapping that isn't meaningful to unit-test in isolation: `index.ts` (excluded from the report entirely), `webhooks/worker.ts`'s `setInterval` wiring, and `db/migrate.ts`'s CLI entry point.
 

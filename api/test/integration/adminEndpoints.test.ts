@@ -7,6 +7,7 @@ const { customers, dunningState, invoices, subscriptionItems, subscriptions, web
   '../../src/db/schema.js'
 );
 const { fakeCustomer, fakeSubscription, fakeSubscriptionItem } = await import('./helpers/stripeFixtures.js');
+const { WRITE_KEY_HEADERS } = await import('./helpers/adminAuth.js');
 
 const app = buildApp();
 
@@ -126,7 +127,7 @@ describe('GET /subscriptions', () => {
     const { id: customerId } = await seedCustomer({ email: 'list-test@example.com' });
     const { id: subscriptionId } = await seedSubscription(customerId);
 
-    const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=100' });
+    const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=100', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     const row = body.subscriptions.find((s: { id: string }) => s.id === subscriptionId);
@@ -140,7 +141,7 @@ describe('GET /subscriptions', () => {
     const { id: customerId } = await seedCustomer();
     await seedSubscription(customerId, { status: 'canceled' });
 
-    const response = await app.inject({ method: 'GET', url: '/subscriptions?status=canceled&limit=100' });
+    const response = await app.inject({ method: 'GET', url: '/subscriptions?status=canceled&limit=100', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.subscriptions.every((s: { status: string }) => s.status === 'canceled')).toBe(true);
@@ -151,13 +152,14 @@ describe('GET /subscriptions', () => {
     await seedSubscription(customerId);
     await seedSubscription(customerId);
 
-    const firstPage = await app.inject({ method: 'GET', url: '/subscriptions?limit=1' });
+    const firstPage = await app.inject({ method: 'GET', url: '/subscriptions?limit=1', headers: WRITE_KEY_HEADERS });
     expect(firstPage.statusCode).toBe(200);
     const firstBody = firstPage.json();
     expect(firstBody.subscriptions).toHaveLength(1);
     expect(firstBody.nextCursor).not.toBeNull();
 
     const secondPage = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'GET',
       url: `/subscriptions?limit=1&cursor=${encodeURIComponent(firstBody.nextCursor)}`,
     });
@@ -167,7 +169,7 @@ describe('GET /subscriptions', () => {
   });
 
   it('rejects an invalid limit', async () => {
-    const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=0' });
+    const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=0', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(400);
   });
 });
@@ -177,7 +179,7 @@ describe('GET /subscriptions/:id', () => {
     const { id: customerId, stripeCustomer } = await seedCustomer({ email: 'detail-test@example.com' });
     const { id: subscriptionId } = await seedSubscription(customerId);
 
-    const response = await app.inject({ method: 'GET', url: `/subscriptions/${subscriptionId}` });
+    const response = await app.inject({ method: 'GET', url: `/subscriptions/${subscriptionId}`, headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.dunning).toBeNull();
@@ -189,7 +191,7 @@ describe('GET /subscriptions/:id', () => {
     const { id: subscriptionId } = await seedSubscription(customerId, { status: 'past_due' });
     await db.insert(dunningState).values({ subscriptionId, stage: 2, noticesSent: 1 });
 
-    const response = await app.inject({ method: 'GET', url: `/subscriptions/${subscriptionId}` });
+    const response = await app.inject({ method: 'GET', url: `/subscriptions/${subscriptionId}`, headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     expect(response.json().dunning.stage).toBe(2);
   });
@@ -200,7 +202,7 @@ describe('GET /invoices', () => {
     const { id: customerId, stripeCustomer } = await seedCustomer({ email: 'invoice-list@example.com' });
     const invoiceId = await seedInvoice(customerId, null);
 
-    const response = await app.inject({ method: 'GET', url: `/invoices?customer_id=${customerId}` });
+    const response = await app.inject({ method: 'GET', url: `/invoices?customer_id=${customerId}`, headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.invoices).toHaveLength(1);
@@ -214,6 +216,7 @@ describe('GET /invoices', () => {
     await seedInvoice(customerId, null, { status: 'void', stripeInvoiceId: `in_void_${Date.now()}` });
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'GET',
       url: `/invoices?customer_id=${customerId}&status=void`,
     });
@@ -223,7 +226,7 @@ describe('GET /invoices', () => {
   });
 
   it('rejects an invalid customer_id', async () => {
-    const response = await app.inject({ method: 'GET', url: '/invoices?customer_id=not-a-uuid' });
+    const response = await app.inject({ method: 'GET', url: '/invoices?customer_id=not-a-uuid', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(400);
   });
 });
@@ -233,7 +236,7 @@ describe('GET /admin/webhook-events', () => {
     const olderId = await seedWebhookEvent({ receivedAt: new Date('2026-01-01T00:00:00Z') });
     const newerId = await seedWebhookEvent({ receivedAt: new Date('2026-01-02T00:00:00Z') });
 
-    const response = await app.inject({ method: 'GET', url: '/admin/webhook-events?limit=100' });
+    const response = await app.inject({ method: 'GET', url: '/admin/webhook-events?limit=100', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     const ids = body.events.map((e: { stripeEventId: string }) => e.stripeEventId);
@@ -244,7 +247,7 @@ describe('GET /admin/webhook-events', () => {
     const failedId = await seedWebhookEvent({ status: 'failed', type: 'invoice.payment_failed' });
     await seedWebhookEvent({ status: 'processed', type: 'invoice.paid' });
 
-    const response = await app.inject({ method: 'GET', url: '/admin/webhook-events?status=failed' });
+    const response = await app.inject({ method: 'GET', url: '/admin/webhook-events?status=failed', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const body = response.json();
     expect(body.events).toHaveLength(1);
@@ -264,6 +267,7 @@ describe('POST /admin/webhook-events/:id/replay', () => {
     });
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: `/admin/webhook-events/${stripeEventId}/replay`,
     });
@@ -281,6 +285,7 @@ describe('POST /admin/webhook-events/:id/replay', () => {
 
   it('returns 404 for an unknown event id', async () => {
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: '/admin/webhook-events/evt_does_not_exist/replay',
     });

@@ -22,6 +22,7 @@ const { customers, dunningState, invoices, reconciliationRuns, subscriptionEvent
   '../../src/db/schema.js'
 );
 const { fakeCustomer, fakeInvoice, fakeSubscription } = await import('./helpers/stripeFixtures.js');
+const { WRITE_KEY_HEADERS } = await import('./helpers/adminAuth.js');
 
 const app = buildApp();
 
@@ -114,7 +115,7 @@ describe('GET /dunning/queue', () => {
       noticesSent: 1,
     });
 
-    const response = await app.inject({ method: 'GET', url: '/dunning/queue' });
+    const response = await app.inject({ method: 'GET', url: '/dunning/queue', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const row = response.json().queue.find((q: { subscriptionId: string }) => q.subscriptionId === subscriptionId);
     expect(row).toBeDefined();
@@ -128,7 +129,7 @@ describe('GET /dunning/queue', () => {
     const customerId = await seedCustomer('healthy@example.com');
     const subscriptionId = await seedSubscription(customerId, 'active');
 
-    const response = await app.inject({ method: 'GET', url: '/dunning/queue' });
+    const response = await app.inject({ method: 'GET', url: '/dunning/queue', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     expect(response.json().queue.some((q: { subscriptionId: string }) => q.subscriptionId === subscriptionId)).toBe(
       false,
@@ -143,6 +144,7 @@ describe('POST /dunning/:id/resolve', () => {
     await db.insert(dunningState).values({ subscriptionId, stage: 2, noticesSent: 1 });
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: `/dunning/${subscriptionId}/resolve`,
       payload: { resolution: 'recovered', note: 'customer paid over the phone' },
@@ -169,6 +171,7 @@ describe('POST /dunning/:id/resolve', () => {
     const subscriptionId = await seedSubscription(customerId, 'active');
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: `/dunning/${subscriptionId}/resolve`,
       payload: { resolution: 'manual', note: 'n/a' },
@@ -182,6 +185,7 @@ describe('POST /dunning/:id/resolve', () => {
     await db.insert(dunningState).values({ subscriptionId, stage: 0, resolvedAt: new Date(), resolution: 'recovered' });
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: `/dunning/${subscriptionId}/resolve`,
       payload: { resolution: 'manual', note: 'n/a' },
@@ -194,6 +198,7 @@ describe('POST /dunning/:id/resolve', () => {
     const subscriptionId = await seedSubscription(customerId);
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: `/dunning/${subscriptionId}/resolve`,
       payload: { resolution: 'manual' },
@@ -238,7 +243,7 @@ describe('GET /admin/reconciliation', () => {
       .returning({ id: reconciliationRuns.id });
     cleanupRunIds.push(newer!.id);
 
-    const response = await app.inject({ method: 'GET', url: '/admin/reconciliation' });
+    const response = await app.inject({ method: 'GET', url: '/admin/reconciliation', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     const ids = response.json().runs.map((r: { id: string }) => r.id);
     expect(ids.indexOf(newer!.id)).toBeLessThan(ids.indexOf(older!.id));
@@ -270,6 +275,7 @@ describe('POST /admin/reconciliation/run', () => {
     cleanupInvoiceIds.push(insertedInvoiceRow!.id);
 
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: '/admin/reconciliation/run',
       payload: {
@@ -290,6 +296,7 @@ describe('POST /admin/reconciliation/run', () => {
 
   it('rejects a window where period_end is not after period_start', async () => {
     const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
       method: 'POST',
       url: '/admin/reconciliation/run',
       payload: {
