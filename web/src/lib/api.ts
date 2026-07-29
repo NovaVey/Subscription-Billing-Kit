@@ -30,7 +30,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE_URL}${path}`, {
     ...init,
     headers: {
-      'Content-Type': 'application/json',
+      // Only set when there's an actual body to describe - Fastify's default
+      // JSON body parser rejects "content-type: application/json" paired
+      // with an empty body outright (a real bug this caught: resumeSubscription
+      // and replayWebhookEvent both POST with no body and were failing with a
+      // 400 in a real browser, invisible to the API's own app.inject-based
+      // tests since inject never sent this header without a payload either).
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
       ...(adminKey ? { Authorization: `Bearer ${adminKey}` } : {}),
       ...init?.headers,
     },
