@@ -26,6 +26,7 @@ export function SubscriptionDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [planModalOpen, setPlanModalOpen] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState<{ atPeriodEnd: boolean } | null>(null);
   const [priceId, setPriceId] = useState('');
   const [quantity, setQuantity] = useState(1);
   const [prorationBehavior, setProrationBehavior] = useState('create_prorations');
@@ -85,6 +86,7 @@ export function SubscriptionDetailPage() {
       notify(err instanceof Error ? err.message : 'Cancel failed', 'alert');
     } finally {
       setBusy(false);
+      setConfirmCancel(null);
     }
   }
 
@@ -159,7 +161,7 @@ export function SubscriptionDetailPage() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => handleCancel(true)}
+            onClick={() => setConfirmCancel({ atPeriodEnd: true })}
             className="border border-ink px-3 py-1.5 text-sm hover:bg-ink hover:text-paper disabled:opacity-50"
           >
             Cancel at period end
@@ -167,7 +169,7 @@ export function SubscriptionDetailPage() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => handleCancel(false)}
+            onClick={() => setConfirmCancel({ atPeriodEnd: false })}
             className="border border-alert px-3 py-1.5 text-sm text-alert hover:bg-alert hover:text-paper disabled:opacity-50"
           >
             Cancel immediately
@@ -366,6 +368,36 @@ export function SubscriptionDetailPage() {
             >
               Apply plan change
             </button>
+          </div>
+        </Modal>
+      )}
+
+      {confirmCancel && (
+        <Modal title="Confirm cancellation" onClose={() => setConfirmCancel(null)}>
+          <div className="flex flex-col gap-4 text-sm">
+            <p>
+              {confirmCancel.atPeriodEnd
+                ? 'This subscription will stop renewing and end at the close of the current period. The customer keeps access until then.'
+                : 'This cancels the subscription with Stripe right now. Access ends immediately - this cannot be undone.'}
+            </p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => handleCancel(confirmCancel.atPeriodEnd)}
+                className="border border-alert px-3 py-1.5 text-alert hover:bg-alert hover:text-paper disabled:opacity-50"
+              >
+                {busy ? 'Canceling…' : 'Yes, cancel'}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirmCancel(null)}
+                className="border border-rule px-3 py-1.5 hover:bg-ink/5 disabled:opacity-50"
+              >
+                Never mind
+              </button>
+            </div>
           </div>
         </Modal>
       )}
