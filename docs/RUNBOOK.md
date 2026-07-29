@@ -42,6 +42,8 @@ Opening the admin UI for the first time in a tab prompts for an admin key - past
 
 If you're on Railway specifically: a service domain created without an explicit target port can silently fail to route any traffic to the container at all — no error, the domain just never receives a request. Always set the target port explicitly to match `API_BASE_URL`'s port.
 
+**Before merging a change that adds a new required env var, set it on every already-deployed environment first, not just in `.env.example`.** A fresh deploy naturally gets it from whoever fills out `.env.example`; an existing deployment doesn't pick up a new required var on its own and will crash on the very next boot with `Invalid environment configuration` (this happened for real when Phase 10 added `ADMIN_API_KEY`/`ADMIN_READONLY_KEY` — the deployed Railway service crashed until both were set on it directly). `npm start`'s migrate-then-serve boot sequence means the process won't even get to `/health` if `env.ts`'s validation fails.
+
 ## The two gotchas that will cost you an afternoon if you miss them
 
 Neither one crashes anything, and `/health` still reports green — the app looks fine either way. Gotcha #1 fails loudly-but-invisibly-to-you: a silent 400 on every webhook delivery, visible only in Stripe's dashboard as a string of failed attempts. Gotcha #2 is quieter still: deliveries return 200, but with fields silently wrong or missing on the received payload — see the Troubleshooting table below for how to tell them apart.
