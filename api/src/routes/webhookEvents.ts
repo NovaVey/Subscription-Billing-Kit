@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { webhookEvents } from '../db/schema.js';
+import { resetWebhookEventForReplay } from '../webhooks/ledger.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const ListQuery = z.object({
   status: z.string().optional(),
@@ -14,11 +16,9 @@ export async function webhookEventRoutes(app: FastifyInstance) {
   // ?status=&type= (§6) - stripe_event_id is the row's own primary key, so
   // no separate uuid identifies a webhook_events row.
   app.get('/admin/webhook-events', async (req, reply) => {
-    const parsed = ListQuery.safeParse(req.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { status, type, limit } = parsed.data;
+    const query = parseOrReply(ListQuery, req.query, reply);
+    if (!query) return;
+    const { status, type, limit } = query;
 
     const conditions = [];
     if (status) conditions.push(eq(webhookEvents.status, status));
@@ -67,22 +67,10 @@ export async function webhookEventRoutes(app: FastifyInstance) {
   app.post('/admin/webhook-events/:id/replay', async (req, reply) => {
     const { id } = req.params as { id: string };
 
-    const [existing] = await db.select().from(webhookEvents).where(eq(webhookEvents.stripeEventId, id));
-    if (!existing) {
+    const ok = await resetWebhookEventForReplay(id);
+    if (!ok) {
       return reply.code(404).send({ error: 'webhook event not found' });
     }
-
-    await db
-      .update(webhookEvents)
-      .set({
-        status: 'received',
-        attempts: 0,
-        nextAttemptAt: null,
-        processingStartedAt: null,
-        processedAt: null,
-        lastError: null,
-      })
-      .where(eq(webhookEvents.stripeEventId, id));
 
     return reply.send({ stripeEventId: id, status: 'received' });
   });

@@ -3,11 +3,11 @@ import type Stripe from 'stripe';
 import { stripe } from '../../stripe/client.js';
 import { db } from '../../db/client.js';
 import { subscriptions } from '../../db/schema.js';
-import { logger } from '../../lib/logger.js';
 import { fromStripeSeconds } from '../../lib/time.js';
 import { syncSubscriptionFromStripe } from '../../stripe/sync.js';
 import { closeDunningOnSubscriptionDeleted } from '../../billing/dunning.js';
 import type { HandlerResult } from './customer.js';
+import { staleGuard } from './staleGuard.js';
 
 export async function handleSubscriptionEvent(event: Stripe.Event): Promise<HandlerResult> {
   const stripeSubscriptionId = (event.data.object as { id: string }).id;
@@ -18,19 +18,14 @@ export async function handleSubscriptionEvent(event: Stripe.Event): Promise<Hand
     .from(subscriptions)
     .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
 
-  // Staleness guard (§5.7): an event older than the newest one already
-  // applied to this row is skipped outright - not because a re-fetch would
-  // return wrong data (it always returns current truth), but because
-  // applying an out-of-order event's semantics (e.g. treating a "created"
-  // event as the first sighting of a subscription that a later event has
-  // already moved past) would write a subscription_events row that reads
-  // as nonsense on the timeline and could re-trigger logic tied to that
-  // event type. Combined with re-fetching, ordering stops mattering.
-  if (existing?.lastEventAt && existing.lastEventAt.getTime() > eventCreatedAt.getTime()) {
-    const reason = `stale: event.created (${eventCreatedAt.toISOString()}) is older than last_event_at (${existing.lastEventAt.toISOString()})`;
-    logger.info({ stripeSubscriptionId, eventType: event.type, reason }, 'skipping stale subscription event');
-    return { skipped: true, skipReason: reason };
-  }
+  const stale = staleGuard({
+    entityLabel: 'subscription',
+    logFields: { stripeSubscriptionId },
+    eventType: event.type,
+    lastEventAt: existing?.lastEventAt,
+    eventCreatedAt,
+  });
+  if (stale) return stale;
 
   // Re-fetch from the Stripe API rather than trust the payload (§5.6).
   const subscription = await stripe.subscriptions.retrieve(stripeSubscriptionId, {

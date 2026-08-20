@@ -7,6 +7,8 @@ import { subscriptionCancelKey, subscriptionPlanChangeKey, subscriptionResumeKey
 import { syncSubscriptionFromStripe } from '../stripe/sync.js';
 import { db } from '../db/client.js';
 import { customers, dunningState, invoices, subscriptionEvents, subscriptionItems, subscriptions } from '../db/schema.js';
+import { loadSubscriptionOr404 } from '../lib/lookups.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const ProrationBehavior = z.enum(['create_prorations', 'none', 'always_invoice']);
 
@@ -115,11 +117,9 @@ export async function subscriptionRoutes(app: FastifyInstance) {
   // page (keyset pagination) - simple and sufficient at this tool's scale,
   // not an offset that drifts as rows are inserted between page loads.
   app.get('/subscriptions', async (req, reply) => {
-    const parsed = ListQuery.safeParse(req.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { status, q, cursor, limit } = parsed.data;
+    const query = parseOrReply(ListQuery, req.query, reply);
+    if (!query) return;
+    const { status, q, cursor, limit } = query;
 
     const conditions = [];
     if (status) conditions.push(eq(subscriptions.status, status));
@@ -182,10 +182,8 @@ export async function subscriptionRoutes(app: FastifyInstance) {
   app.get('/subscriptions/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
 
     // customerRow is the only query below that depends on subRow's data
     // (customerId) - everything else only needs the path param `id`, so
@@ -216,16 +214,12 @@ export async function subscriptionRoutes(app: FastifyInstance) {
 
   app.get('/subscriptions/:id/preview', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const parsed = PreviewQuery.safeParse(req.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { price_id, quantity, proration_behavior } = parsed.data;
+    const query = parseOrReply(PreviewQuery, req.query, reply);
+    if (!query) return;
+    const { price_id, quantity, proration_behavior } = query;
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
     const itemRow = await loadActiveItem(id);
     if (!itemRow) {
       return reply.code(409).send({ error: 'subscription has no active item to change' });
@@ -253,16 +247,12 @@ export async function subscriptionRoutes(app: FastifyInstance) {
 
   app.post('/subscriptions/:id/plan', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const parsed = PlanChangeBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { price_id, quantity, proration_behavior } = parsed.data;
+    const body = parseOrReply(PlanChangeBody, req.body, reply);
+    if (!body) return;
+    const { price_id, quantity, proration_behavior } = body;
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
     const itemRow = await loadActiveItem(id);
     if (!itemRow) {
       return reply.code(409).send({ error: 'subscription has no active item to change' });
@@ -289,16 +279,12 @@ export async function subscriptionRoutes(app: FastifyInstance) {
 
   app.post('/subscriptions/:id/cancel', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const parsed = CancelBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { at_period_end } = parsed.data;
+    const body = parseOrReply(CancelBody, req.body, reply);
+    if (!body) return;
+    const { at_period_end } = body;
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
 
     const requestedAt = new Date();
     const idempotencyKey = subscriptionCancelKey(id, at_period_end, requestedAt);
@@ -325,10 +311,8 @@ export async function subscriptionRoutes(app: FastifyInstance) {
   app.post('/subscriptions/:id/resume', async (req, reply) => {
     const { id } = req.params as { id: string };
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
 
     const requestedAt = new Date();
     const idempotencyKey = subscriptionResumeKey(id, requestedAt);

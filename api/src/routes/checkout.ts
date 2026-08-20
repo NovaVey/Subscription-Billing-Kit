@@ -1,9 +1,8 @@
-import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { createCheckoutSession } from '../stripe/checkout.js';
-import { db } from '../db/client.js';
-import { customers } from '../db/schema.js';
+import { loadCustomerOr404 } from '../lib/lookups.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const CreateCheckoutSessionBody = z.object({
   customer_id: z.string().uuid(),
@@ -13,16 +12,12 @@ const CreateCheckoutSessionBody = z.object({
 
 export async function checkoutRoutes(app: FastifyInstance) {
   app.post('/checkout/sessions', async (req, reply) => {
-    const parsed = CreateCheckoutSessionBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { customer_id, price_id, quantity } = parsed.data;
+    const body = parseOrReply(CreateCheckoutSessionBody, req.body, reply);
+    if (!body) return;
+    const { customer_id, price_id, quantity } = body;
 
-    const [customerRow] = await db.select().from(customers).where(eq(customers.id, customer_id));
-    if (!customerRow) {
-      return reply.code(404).send({ error: 'customer not found' });
-    }
+    const customerRow = await loadCustomerOr404(customer_id, reply);
+    if (!customerRow) return;
 
     const { url } = await createCheckoutSession({
       stripeCustomerId: customerRow.stripeCustomerId,

@@ -6,6 +6,7 @@ import { customerCreateKey } from '../stripe/idempotency.js';
 import { syncCustomerFromStripe } from '../stripe/sync.js';
 import { db } from '../db/client.js';
 import { customers } from '../db/schema.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const CreateCustomerBody = z.object({
   external_ref: z.string().min(1),
@@ -15,11 +16,9 @@ const CreateCustomerBody = z.object({
 
 export async function customerRoutes(app: FastifyInstance) {
   app.post('/customers', async (req, reply) => {
-    const parsed = CreateCustomerBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { external_ref, email, name } = parsed.data;
+    const body = parseOrReply(CreateCustomerBody, req.body, reply);
+    if (!body) return;
+    const { external_ref, email, name } = body;
 
     // Local-first idempotency: Stripe's own idempotency key only guards a
     // retry within its retention window (currently 24h). A request for an

@@ -6,12 +6,9 @@ import { customers, invoices, subscriptions } from '../../db/schema.js';
 import { logger } from '../../lib/logger.js';
 import { fromStripeSeconds, fromStripeSecondsOrNull } from '../../lib/time.js';
 import { openDunningCycleOnPaymentFailed, resolveDunningOnInvoicePaid } from '../../billing/dunning.js';
+import { resolveId } from '../../stripe/refs.js';
 import type { HandlerResult } from './customer.js';
-
-function resolveId(ref: string | { id: string } | null | undefined): string | undefined {
-  if (!ref) return undefined;
-  return typeof ref === 'string' ? ref : ref.id;
-}
+import { staleGuard } from './staleGuard.js';
 
 // As of this pinned API version, an invoice's subscription is NOT a
 // top-level `invoice.subscription` field (that's the older shape most
@@ -36,13 +33,14 @@ export async function handleInvoiceEvent(event: Stripe.Event): Promise<HandlerRe
     .from(invoices)
     .where(eq(invoices.stripeInvoiceId, stripeInvoiceId));
 
-  // Staleness guard (§5.7) — see the identical rationale in
-  // handlers/subscription.ts.
-  if (existing?.lastEventAt && existing.lastEventAt.getTime() > eventCreatedAt.getTime()) {
-    const reason = `stale: event.created (${eventCreatedAt.toISOString()}) is older than last_event_at (${existing.lastEventAt.toISOString()})`;
-    logger.info({ stripeInvoiceId, eventType: event.type, reason }, 'skipping stale invoice event');
-    return { skipped: true, skipReason: reason };
-  }
+  const stale = staleGuard({
+    entityLabel: 'invoice',
+    logFields: { stripeInvoiceId },
+    eventType: event.type,
+    lastEventAt: existing?.lastEventAt,
+    eventCreatedAt,
+  });
+  if (stale) return stale;
 
   let invoice: Stripe.Invoice;
   try {
