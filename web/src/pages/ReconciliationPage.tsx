@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { listReconciliationRuns, runReconciliation } from '../lib/api';
-import type { ReconciliationReportEntry, ReconciliationRun } from '../lib/types';
+import { getReconciliationRun, listReconciliationRuns, runReconciliation } from '../lib/api';
+import type { ReconciliationReportEntry, ReconciliationRun, ReconciliationRunDetail } from '../lib/types';
 import { Amount } from '../components/Amount';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
@@ -21,7 +21,8 @@ export function ReconciliationPage() {
   const [runs, setRuns] = useState<ReconciliationRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<ReconciliationRun | null>(null);
+  const [selected, setSelected] = useState<ReconciliationRunDetail | null>(null);
+  const [drillingIn, setDrillingIn] = useState<string | null>(null);
 
   const [periodStart, setPeriodStart] = useState('');
   const [periodEnd, setPeriodEnd] = useState('');
@@ -39,6 +40,20 @@ export function ReconciliationPage() {
   }
 
   useEffect(reload, []);
+
+  // The list response no longer carries `report` - fetch the full row on
+  // demand only when an operator actually drills into it.
+  async function handleDrillIn(run: ReconciliationRun) {
+    setDrillingIn(run.id);
+    try {
+      const detail = await getReconciliationRun(run.id);
+      setSelected(detail);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Could not load run detail', 'alert');
+    } finally {
+      setDrillingIn(null);
+    }
+  }
 
   async function handleRun() {
     if (!periodStart || !periodEnd || !currency) return;
@@ -163,10 +178,11 @@ export function ReconciliationPage() {
                   <td className="py-2 pr-4 text-right">
                     <button
                       type="button"
-                      onClick={() => setSelected(run)}
-                      className="border border-ink px-2 py-1 text-xs hover:bg-ink hover:text-paper"
+                      disabled={drillingIn === run.id}
+                      onClick={() => handleDrillIn(run)}
+                      className="border border-ink px-2 py-1 text-xs hover:bg-ink hover:text-paper disabled:opacity-50"
                     >
-                      Drill in
+                      {drillingIn === run.id ? 'Loading…' : 'Drill in'}
                     </button>
                   </td>
                 </tr>

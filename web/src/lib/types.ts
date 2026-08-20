@@ -137,12 +137,13 @@ export interface DunningQueueResponse {
   queue: DunningQueueRow[];
 }
 
+// The list endpoint's shape - no `payload`, so a page load never pulls or
+// ships every row's full raw Stripe event JSON. See WebhookEventDetail.
 export interface WebhookEvent {
   stripeEventId: string;
   type: string;
   apiVersion: string | null;
   eventCreatedAt: string;
-  payload: Record<string, unknown>;
   receivedAt: string;
   processingStartedAt: string | null;
   processedAt: string | null;
@@ -150,6 +151,12 @@ export interface WebhookEvent {
   attempts: number;
   nextAttemptAt: string | null;
   lastError: string | null;
+}
+
+// GET /admin/webhook-events/:id's shape - fetched on demand when a single
+// row is expanded.
+export interface WebhookEventDetail extends WebhookEvent {
+  payload: Record<string, unknown>;
 }
 
 export interface WebhookEventListResponse {
@@ -164,6 +171,8 @@ export interface ReconciliationReportEntry {
   localValue?: unknown;
 }
 
+// The list endpoint's shape - no `report`, so a page load never pulls or
+// ships the full mismatch report for every run. See ReconciliationRunDetail.
 export interface ReconciliationRun {
   id: string;
   periodStart: string;
@@ -175,6 +184,11 @@ export interface ReconciliationRun {
   invoiceCountStripe: number;
   invoiceCountLocal: number;
   mismatchCount: number;
+}
+
+// GET /admin/reconciliation/:id's shape - fetched on demand when a single
+// run is drilled into.
+export interface ReconciliationRunDetail extends ReconciliationRun {
   report: ReconciliationReportEntry[];
 }
 

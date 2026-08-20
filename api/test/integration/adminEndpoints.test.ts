@@ -253,6 +253,42 @@ describe('GET /admin/webhook-events', () => {
     expect(body.events).toHaveLength(1);
     expect(body.events[0].stripeEventId).toBe(failedId);
   });
+
+  it('omits `payload` from every row - fetched separately via the detail route', async () => {
+    await seedWebhookEvent();
+
+    const response = await app.inject({ method: 'GET', url: '/admin/webhook-events?limit=100', headers: WRITE_KEY_HEADERS });
+    const body = response.json();
+    expect(body.events.length).toBeGreaterThan(0);
+    for (const event of body.events) {
+      expect(event).not.toHaveProperty('payload');
+    }
+  });
+});
+
+describe('GET /admin/webhook-events/:id', () => {
+  it('returns the full row, including payload', async () => {
+    const stripeEventId = await seedWebhookEvent({ payload: { id: 'evt_full_detail', foo: 'bar' } });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/admin/webhook-events/${stripeEventId}`,
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.stripeEventId).toBe(stripeEventId);
+    expect(body.payload).toEqual({ id: 'evt_full_detail', foo: 'bar' });
+  });
+
+  it('returns 404 for an unknown event id', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/admin/webhook-events/evt_does_not_exist',
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(404);
+  });
 });
 
 describe('POST /admin/webhook-events/:id/replay', () => {

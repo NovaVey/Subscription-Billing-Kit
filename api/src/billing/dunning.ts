@@ -1,4 +1,4 @@
-import { and, eq, gte, isNull, lte, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { db, type Executor } from '../db/client.js';
 import { dunningNotices, dunningState } from '../db/schema.js';
 import { logger } from '../lib/logger.js';
@@ -174,13 +174,16 @@ export async function closeDunningOnSubscriptionDeleted(
 }
 
 // Escalates every cycle whose current stage's grace period has elapsed.
-// Stage advance and the target notice row are written in one transaction,
-// guarded by an optimistic `where stage = fromStage` so a row already
-// escalated by a concurrent tick is skipped rather than double-escalated.
-// The notice is only *armed* here (sent_at left null) - actually sending is
-// sendUnsentDunningNotices()'s job, run every tick after this pass, so a
-// crash between the two can only ever leave a notice unsent, never resend
-// one already confirmed sent.
+// Grouped by fromStage - only ever 1, 2, or 3 - into one bulk UPDATE per
+// group instead of one transaction per row: the same optimistic
+// `where stage = fromStage` guard (a row already escalated by a concurrent
+// tick is skipped rather than double-escalated) applies just as well across
+// a whole IN-list as it does to a single row. The claimed rows' notices are
+// then armed with one batched multi-row insert. Notices are only *armed*
+// here (sent_at left null) - actually sending is sendUnsentDunningNotices()'s
+// job, run every tick after this pass, so a crash between the two can only
+// ever leave a notice unsent, never resend one already confirmed sent. See
+// the /improve audit for why this used to be one transaction per row.
 async function escalateDueCycles(now: Date): Promise<number> {
   const due = await db
     .select()
@@ -195,11 +198,15 @@ async function escalateDueCycles(now: Date): Promise<number> {
     );
 
   let escalated = 0;
-  for (const row of due) {
-    const fromStage = row.stage as 1 | 2 | 3;
-    const toStage = (fromStage + 1) as 2 | 3 | 4;
 
-    await db.transaction(async (tx) => {
+  for (const fromStage of [1, 2, 3] as const) {
+    const rowsForStage = due.filter((row) => row.stage === fromStage);
+    if (rowsForStage.length === 0) continue;
+
+    const toStage = (fromStage + 1) as 2 | 3 | 4;
+    const ids = rowsForStage.map((row) => row.subscriptionId);
+
+    const claimedCount = await db.transaction(async (tx) => {
       const claimed = await tx
         .update(dunningState)
         .set({
@@ -207,20 +214,35 @@ async function escalateDueCycles(now: Date): Promise<number> {
           enteredStageAt: now,
           nextActionAt: toStage < 4 ? nextActionAtForStage(toStage as 1 | 2 | 3, now) : null,
         })
-        .where(and(eq(dunningState.subscriptionId, row.subscriptionId), eq(dunningState.stage, fromStage)))
+        .where(and(inArray(dunningState.subscriptionId, ids), eq(dunningState.stage, fromStage)))
         .returning({ subscriptionId: dunningState.subscriptionId });
 
-      if (claimed.length === 0) return; // a concurrent tick already advanced this row
-
-      if (toStage <= 3) {
-        await armNotice(tx, { subscriptionId: row.subscriptionId, stage: toStage as 1 | 2 | 3, resetIfStale: false });
-      }
       // toStage === 4 ("access revoked, marked terminal", §5.10) sends no
       // further notice - the table describes an access change at stage 4,
       // not a communication, unlike stages 1-3.
+      if (claimed.length > 0 && toStage <= 3) {
+        const stage = toStage as 1 | 2 | 3;
+        const template = templateForStage(stage);
+        await tx
+          .insert(dunningNotices)
+          .values(
+            claimed.map((row) => ({
+              subscriptionId: row.subscriptionId,
+              stage,
+              channel: 'email',
+              template,
+              payload: { subscriptionId: row.subscriptionId, stage },
+            })),
+          )
+          .onConflictDoNothing({ target: [dunningNotices.subscriptionId, dunningNotices.stage] });
+      }
+
+      return claimed.length;
     });
-    escalated++;
+
+    escalated += claimedCount;
   }
+
   return escalated;
 }
 

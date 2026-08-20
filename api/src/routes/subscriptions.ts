@@ -186,23 +186,23 @@ export async function subscriptionRoutes(app: FastifyInstance) {
     if (!subRow) {
       return reply.code(404).send({ error: 'subscription not found' });
     }
-    const [customerRow] = await db.select().from(customers).where(eq(customers.id, subRow.customerId));
 
-    const items = await db
-      .select()
-      .from(subscriptionItems)
-      .where(eq(subscriptionItems.subscriptionId, id));
-    const timeline = await db
-      .select()
-      .from(subscriptionEvents)
-      .where(eq(subscriptionEvents.subscriptionId, id))
-      .orderBy(asc(subscriptionEvents.occurredAt));
-    const invoiceRows = await db
-      .select()
-      .from(invoices)
-      .where(eq(invoices.subscriptionId, id))
-      .orderBy(desc(invoices.periodStart));
-    const [dunningRow] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, id));
+    // customerRow is the only query below that depends on subRow's data
+    // (customerId) - everything else only needs the path param `id`, so
+    // there's no reason to pay 5 sequential round trips when 2 stages
+    // (this 404 check, then these 5 together) is achievable. See the
+    // /improve audit.
+    const [customerRow, items, timeline, invoiceRows, [dunningRow]] = await Promise.all([
+      db.select().from(customers).where(eq(customers.id, subRow.customerId)).then(([row]) => row),
+      db.select().from(subscriptionItems).where(eq(subscriptionItems.subscriptionId, id)),
+      db
+        .select()
+        .from(subscriptionEvents)
+        .where(eq(subscriptionEvents.subscriptionId, id))
+        .orderBy(asc(subscriptionEvents.occurredAt)),
+      db.select().from(invoices).where(eq(invoices.subscriptionId, id)).orderBy(desc(invoices.periodStart)),
+      db.select().from(dunningState).where(eq(dunningState.subscriptionId, id)),
+    ]);
 
     return reply.send({
       subscription: subRow,
