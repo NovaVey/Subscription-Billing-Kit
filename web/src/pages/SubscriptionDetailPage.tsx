@@ -313,7 +313,16 @@ export function SubscriptionDetailPage() {
               Price id
               <input
                 value={priceId}
-                onChange={(e) => setPriceId(e.target.value)}
+                onChange={(e) => {
+                  setPriceId(e.target.value);
+                  // A stale preview must not survive an edit to the fields it
+                  // was computed from - otherwise "Apply plan change" stays
+                  // enabled showing a proration total for the pre-edit values
+                  // (e.g. preview at quantity 1, bump to 5, apply still shows
+                  // the quantity-1 amount).
+                  setPreview(null);
+                  setPreviewError(null);
+                }}
                 className="border border-rule px-2 py-1"
                 placeholder="price_..."
               />
@@ -324,7 +333,11 @@ export function SubscriptionDetailPage() {
                 type="number"
                 min={1}
                 value={quantity}
-                onChange={(e) => setQuantity(Number(e.target.value))}
+                onChange={(e) => {
+                  setQuantity(Number(e.target.value));
+                  setPreview(null);
+                  setPreviewError(null);
+                }}
                 className="num border border-rule px-2 py-1"
               />
             </label>
@@ -332,7 +345,11 @@ export function SubscriptionDetailPage() {
               Proration behavior
               <select
                 value={prorationBehavior}
-                onChange={(e) => setProrationBehavior(e.target.value)}
+                onChange={(e) => {
+                  setProrationBehavior(e.target.value);
+                  setPreview(null);
+                  setPreviewError(null);
+                }}
                 className="border border-rule px-2 py-1"
               >
                 {PRORATION_OPTIONS.map((p) => (

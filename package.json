@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck --workspace=api && npm run typecheck --workspace=web",
     "test:unit": "npm run test:unit --workspace=api",
     "test:integration": "npm run test:integration --workspace=api",
+    "test:web": "npm run test --workspace=web",
     "db:generate": "npm run db:generate --workspace=api",
     "db:migrate": "npm run db:migrate --workspace=api",
     "seed:catalog": "tsx scripts/seed-catalog.ts",
