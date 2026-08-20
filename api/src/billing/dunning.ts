@@ -96,6 +96,18 @@ export async function openDunningCycleOnPaymentFailed(
         resolution: null,
       })
       .where(eq(dunningState.subscriptionId, input.subscriptionId));
+
+    // dunning_notices' uniqueness is scoped to (subscriptionId, stage) only,
+    // not to a cycle - a stage 2/3 row this subscription's PRIOR (now
+    // resolved) cycle already sent would otherwise still be sitting here
+    // with sent_at set. Left in place, escalateDueCycles()'s later
+    // armNotice(..., resetIfStale:false) call for this new cycle would hit
+    // that row's conflict and silently no-op, so the new cycle's stage 2/3
+    // notice would never be armed or sent even though dunning_state.stage
+    // correctly advances. Clearing every notice row for this subscription
+    // when a cycle re-opens guarantees the new cycle starts with a clean
+    // slate to arm against.
+    await tx.delete(dunningNotices).where(eq(dunningNotices.subscriptionId, input.subscriptionId));
   } else {
     await tx.insert(dunningState).values({
       subscriptionId: input.subscriptionId,
@@ -107,9 +119,10 @@ export async function openDunningCycleOnPaymentFailed(
   }
 
   // Opening a cycle is only reached when we already know no cycle is
-  // currently open (checked above), so any existing stage-1 notice row is
-  // necessarily left over from an earlier, already-resolved cycle - safe to
-  // reset unconditionally.
+  // currently open (checked above), and the branch above just cleared any
+  // leftover notice rows on a re-open - so armNotice's own conflict target
+  // is guaranteed empty here either way. resetIfStale:true is kept as
+  // defense in depth, not as the thing doing the work.
   await armNotice(tx, { subscriptionId: input.subscriptionId, stage: 1, resetIfStale: true });
 }
 
@@ -222,7 +235,23 @@ async function escalateDueCycles(now: Date): Promise<number> {
 // in-process interval, so in practice there is no race here at all, only
 // crash recovery across ticks).
 async function sendUnsentDunningNotices(): Promise<{ sent: number; failed: number }> {
-  const unsent = await db.select().from(dunningNotices).where(isNull(dunningNotices.sentAt));
+  // A notice can be armed (sent_at left null) in the same window a
+  // concurrent invoice.paid resolves its cycle - armNotice() and
+  // resolveDunningOnInvoicePaid() are separate transactions, not atomic
+  // with each other. Joining against dunning_state and requiring
+  // resolved_at IS NULL here means a notice for an already-resolved cycle
+  // is never sent, even if it was armed moments before resolution landed.
+  const unsent = await db
+    .select({
+      id: dunningNotices.id,
+      subscriptionId: dunningNotices.subscriptionId,
+      stage: dunningNotices.stage,
+      template: dunningNotices.template,
+      payload: dunningNotices.payload,
+    })
+    .from(dunningNotices)
+    .innerJoin(dunningState, eq(dunningState.subscriptionId, dunningNotices.subscriptionId))
+    .where(and(isNull(dunningNotices.sentAt), isNull(dunningState.resolvedAt)));
 
   let sent = 0;
   let failed = 0;

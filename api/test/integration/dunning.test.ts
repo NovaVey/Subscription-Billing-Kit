@@ -310,3 +310,94 @@ describe('escalates through every stage and resolves on a late payment', () => {
     expect(finalState?.stage).toBe(0);
   });
 });
+
+describe('resolved-cycle-does-not-still-send-a-notice-armed-before-it-resolved', () => {
+  it('never sends a dunning_notices row whose owning dunning_state cycle already resolved', async () => {
+    const { subRow } = await seedCustomerAndSubscription();
+
+    // Simulates the exact race this guards against: a notice was armed
+    // (sent_at left null) in the same window a concurrent invoice.paid
+    // resolved the cycle - armNotice()'s write and
+    // resolveDunningOnInvoicePaid() are separate transactions, not atomic
+    // with each other.
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 0,
+      enteredStageAt: new Date(),
+      nextActionAt: null,
+      resolvedAt: new Date(),
+      resolution: 'recovered',
+    });
+    await db.insert(dunningNotices).values({
+      subscriptionId: subRow.id,
+      stage: 2,
+      channel: 'email',
+      template: 'dunning_stage_2_reminder',
+      sentAt: null,
+    });
+
+    await runDunningTick();
+
+    const [notice] = await db
+      .select()
+      .from(dunningNotices)
+      .where(and(eq(dunningNotices.subscriptionId, subRow.id), eq(dunningNotices.stage, 2)));
+    expect(notice?.sentAt).toBeNull();
+    expect(mockEmailSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('re-opening-a-resolved-cycle-clears-stale-notices-from-the-prior-cycle', () => {
+  it('lets the new cycle arm and send its own stage 2 notice even though the prior cycle already sent one', async () => {
+    const { subscription, subRow } = await seedCustomerAndSubscription();
+
+    // A fully-completed prior cycle: it reached and sent a stage 2 notice,
+    // then resolved.
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 0,
+      enteredStageAt: new Date(Date.now() - 30 * 86_400_000),
+      nextActionAt: null,
+      resolvedAt: new Date(Date.now() - 20 * 86_400_000),
+      resolution: 'recovered',
+    });
+    await db.insert(dunningNotices).values({
+      subscriptionId: subRow.id,
+      stage: 2,
+      channel: 'email',
+      template: 'dunning_stage_2_reminder',
+      sentAt: new Date(Date.now() - 20 * 86_400_000),
+    });
+
+    // A brand new invoice fails on the same subscription, opening a fresh cycle.
+    const newFailedInvoice = subscriptionLinkedInvoice(subscription.id, subscription.customer, { status: 'open' });
+    mockInvoicesRetrieve.mockResolvedValueOnce(newFailedInvoice);
+    await handleInvoiceEvent(fakeEvent('invoice.payment_failed', newFailedInvoice) as never);
+    const [newInvoiceRow] = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeInvoiceId, newFailedInvoice.id));
+    cleanupInvoiceIds.push(newInvoiceRow!.id);
+
+    expect((await getDunningState(subRow.id))?.stage).toBe(1);
+
+    // Drive the new cycle to stage 2, same technique as "escalates through
+    // every stage" above.
+    await db
+      .update(dunningState)
+      .set({ nextActionAt: new Date(Date.now() - 1000) })
+      .where(eq(dunningState.subscriptionId, subRow.id));
+    await runDunningTick();
+    expect((await getDunningState(subRow.id))?.stage).toBe(2);
+
+    const stage2Notices = await db
+      .select()
+      .from(dunningNotices)
+      .where(and(eq(dunningNotices.subscriptionId, subRow.id), eq(dunningNotices.stage, 2)));
+    expect(stage2Notices).toHaveLength(1); // the stale row was cleared, not left as a blocking second row
+    expect(stage2Notices[0]?.sentAt).not.toBeNull(); // and the new cycle's own stage 2 notice DID send
+
+    const stage2SendCalls = mockEmailSend.mock.calls.filter(([arg]) => (arg as { stage: number }).stage === 2);
+    expect(stage2SendCalls).toHaveLength(1); // sent for the new cycle - proves the old row didn't block it
+  });
+});
