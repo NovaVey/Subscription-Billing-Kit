@@ -64,3 +64,37 @@ describe('idempotency keys are deterministic for the same operation', () => {
     expect(subscriptionResumeKey('sub_1', requestedAt)).toBe(subscriptionResumeKey('sub_1', requestedAt));
   });
 });
+
+describe('buildKey joins parts with a bare colon and does not escape them', () => {
+  it('collides two logically different checkout-session calls when a colon inside one part shifts the token boundary onto the next part', () => {
+    // buildKey (idempotency.ts) does `parts.map(String).join(':')` with no
+    // escaping. checkoutSessionKey passes [ 'checkout', customerId, priceId,
+    // quantity, requestedAt.toISOString() ]. If customerId itself contains a
+    // colon, the tail of customerId and the head of priceId can rearrange
+    // into an identical joined string for a *different* (customerId,
+    // priceId) pair, as long as quantity and requestedAt are held equal:
+    //
+    //   ['checkout', 'cust_1:price_1', '2', '3', iso].join(':')
+    //     === 'checkout:cust_1:price_1:2:3:' + iso
+    //   ['checkout', 'cust_1', 'price_1:2', '3', iso].join(':')
+    //     === 'checkout:cust_1:price_1:2:3:' + iso
+    //
+    // Same joined string, but the two calls describe different operations:
+    // customerId 'cust_1:price_1' with priceId '2', versus customerId
+    // 'cust_1' with priceId 'price_1:2'.
+    const requestedAt = new Date('2026-01-15T12:00:00.000Z');
+    const keyA = checkoutSessionKey('cust_1:price_1', '2', 3, requestedAt);
+    const keyB = checkoutSessionKey('cust_1', 'price_1:2', 3, requestedAt);
+
+    // This is NOT a confirmation that buildKey is safe. The two calls above
+    // have different, distinct inputs (different customerId/priceId pairs)
+    // yet produce the same key — this test PINS a known, currently latent
+    // collision risk in buildKey's unescaped ':' join, it does not clear it.
+    // It is only "theoretical" today because real Stripe ids
+    // (cus_/price_/sub_/...) never contain colons; if that assumption ever
+    // breaks (or buildKey is reused for a caller-supplied string), this
+    // collision becomes a real double-idempotency-key bug where two
+    // different operations dedupe against the same Stripe idempotency key.
+    expect(keyA).toBe(keyB);
+  });
+});

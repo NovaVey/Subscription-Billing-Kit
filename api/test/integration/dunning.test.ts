@@ -2,11 +2,13 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockInvoicesRetrieve = vi.fn();
+const mockSubscriptionsRetrieve = vi.fn();
 const mockEmailSend = vi.fn();
 
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
     invoices: { retrieve: (...args: unknown[]) => mockInvoicesRetrieve(...args) },
+    subscriptions: { retrieve: (...args: unknown[]) => mockSubscriptionsRetrieve(...args) },
   },
 }));
 
@@ -15,16 +17,17 @@ vi.mock('../../src/billing/emailAdapter.js', () => ({
 }));
 
 const { db, pool } = await import('../../src/db/client.js');
-const { customers, dunningNotices, dunningState, invoices, subscriptions } = await import(
-  '../../src/db/schema.js'
-);
+const { customers, dunningNotices, dunningState, invoices, subscriptionEvents, subscriptions, webhookEvents } =
+  await import('../../src/db/schema.js');
 const { handleInvoiceEvent } = await import('../../src/webhooks/handlers/invoice.js');
+const { handleSubscriptionEvent } = await import('../../src/webhooks/handlers/subscription.js');
 const { runDunningTick } = await import('../../src/billing/dunning.js');
 const { fakeCustomer, fakeEvent, fakeInvoice, fakeSubscription } = await import('./helpers/stripeFixtures.js');
 
 const cleanupSubscriptionIds: string[] = [];
 const cleanupCustomerIds: string[] = [];
 const cleanupInvoiceIds: string[] = [];
+const cleanupWebhookEventIds: string[] = [];
 
 async function seedCustomerAndSubscription() {
   const customer = fakeCustomer();
@@ -73,17 +76,22 @@ async function getDunningState(subscriptionId: string) {
 
 beforeEach(() => {
   mockInvoicesRetrieve.mockReset();
+  mockSubscriptionsRetrieve.mockReset();
   mockEmailSend.mockReset();
   mockEmailSend.mockResolvedValue(undefined);
 });
 
 afterAll(async () => {
-  // dunning_notices/dunning_state reference subscriptions/invoices, so they
-  // must be cleaned up before either of those (same FK ordering discipline
-  // as every other integration suite's afterAll - see subscriptionProjection.test.ts).
+  // dunning_notices/dunning_state/subscription_events reference
+  // subscriptions/invoices/webhook_events, so they must be cleaned up before
+  // any of those (same FK ordering discipline as every other integration
+  // suite's afterAll - see subscriptionProjection.test.ts). subscription_events
+  // rows only exist here because the subscription-deleted test drives the
+  // real handleSubscriptionEvent handler, which records a state transition.
   for (const id of cleanupSubscriptionIds) {
     await db.delete(dunningNotices).where(eq(dunningNotices.subscriptionId, id));
     await db.delete(dunningState).where(eq(dunningState.subscriptionId, id));
+    await db.delete(subscriptionEvents).where(eq(subscriptionEvents.subscriptionId, id));
   }
   for (const id of cleanupInvoiceIds) {
     await db.delete(invoices).where(eq(invoices.id, id));
@@ -93,6 +101,9 @@ afterAll(async () => {
   }
   for (const id of cleanupCustomerIds) {
     await db.delete(customers).where(eq(customers.id, id));
+  }
+  for (const id of cleanupWebhookEventIds) {
+    await db.delete(webhookEvents).where(eq(webhookEvents.stripeEventId, id));
   }
   await pool.end();
 });
@@ -399,5 +410,75 @@ describe('re-opening-a-resolved-cycle-clears-stale-notices-from-the-prior-cycle'
 
     const stage2SendCalls = mockEmailSend.mock.calls.filter(([arg]) => (arg as { stage: number }).stage === 2);
     expect(stage2SendCalls).toHaveLength(1); // sent for the new cycle - proves the old row didn't block it
+  });
+});
+
+describe('subscription-deleted-closes-an-open-dunning-cycle-permanently', () => {
+  it('closes an open dunning cycle as canceled on customer.subscription.deleted, and a later tick does not re-escalate or re-notify it', async () => {
+    const { subscription, subRow } = await seedCustomerAndSubscription();
+
+    // Open dunning cycle already at stage 2 - same direct-seed technique as
+    // "crash-between-notice-write-and-send-does-not-double-email" above.
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 2,
+      enteredStageAt: new Date(),
+      nextActionAt: new Date(Date.now() + 7 * 86_400_000),
+    });
+
+    const canceledSubscription = fakeSubscription({
+      id: subscription.id,
+      customer: subscription.customer,
+      status: 'canceled',
+    });
+    const deletedEvent = fakeEvent('customer.subscription.deleted', canceledSubscription);
+
+    // handleSubscriptionEvent is normally only reached after the processor
+    // has already persisted the webhook_events row (that's how every other
+    // integration suite exercises it - see subscriptionProjection.test.ts).
+    // Calling it directly here, the same way this file already calls
+    // handleInvoiceEvent directly, means the status change to 'canceled'
+    // needs its own webhook_events row up front: syncSubscriptionFromStripe's
+    // recordTransition() writes subscription_events.stripe_event_id, which
+    // has a real FK to webhook_events.stripe_event_id.
+    await db.insert(webhookEvents).values({
+      stripeEventId: deletedEvent.id,
+      type: deletedEvent.type,
+      apiVersion: deletedEvent.api_version,
+      eventCreatedAt: new Date(deletedEvent.created * 1000),
+      payload: deletedEvent,
+      status: 'received',
+    });
+    cleanupWebhookEventIds.push(deletedEvent.id);
+
+    mockSubscriptionsRetrieve.mockResolvedValueOnce(canceledSubscription);
+    await handleSubscriptionEvent(deletedEvent as never);
+
+    const closedState = await getDunningState(subRow.id);
+    expect(closedState?.stage).toBe(4);
+    expect(closedState?.resolvedAt).not.toBeNull();
+    expect(closedState?.resolution).toBe('canceled');
+    expect(closedState?.nextActionAt).toBeNull();
+
+    // Terminal-by-cancellation, not terminal-by-timeout (§5.10's stage 4 via
+    // escalateDueCycles) - resolvedAt is already set, so a later tick must
+    // not escalate this cycle further or send anything for it.
+    await runDunningTick();
+
+    const afterTick = await getDunningState(subRow.id);
+    expect(afterTick?.stage).toBe(4);
+    expect(afterTick?.resolvedAt).not.toBeNull();
+    expect(afterTick?.resolution).toBe('canceled');
+
+    const notices = await db
+      .select()
+      .from(dunningNotices)
+      .where(eq(dunningNotices.subscriptionId, subRow.id));
+    expect(notices).toHaveLength(0); // no notice was ever armed or sent for this cycle
+
+    const sendCallsForSub = mockEmailSend.mock.calls.filter(
+      ([arg]) => (arg as { subscriptionId: string }).subscriptionId === subRow.id,
+    );
+    expect(sendCallsForSub).toHaveLength(0);
   });
 });

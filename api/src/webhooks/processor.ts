@@ -12,7 +12,13 @@ export const MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_SECONDS = 30;
 const MAX_BACKOFF_SECONDS = 3600;
 
-// Exponential backoff: 30s, 60s, 120s, 240s, 480s, then capped at 1 hour.
+// Exponential backoff: 30s, 60s, 120s, 240s, 480s, 960s, then plateaus at
+// 1920s (32 min) once the exponent clamp at attempts=7 kicks in - the
+// MAX_BACKOFF_SECONDS=3600 cap below is unreachable through this formula
+// (30 * 2^6 = 1920 < 3600) and is dead code as currently written. Neither
+// matters in production today: MAX_ATTEMPTS=5 means processRow never calls
+// this with attempts >= 6. Corrected by the /improve audit, which verified
+// the actual sequence against the code rather than trusting this comment.
 export function computeBackoffSeconds(attempts: number): number {
   const exponent = Math.min(attempts, 7) - 1;
   return Math.min(BASE_BACKOFF_SECONDS * 2 ** Math.max(exponent, 0), MAX_BACKOFF_SECONDS);

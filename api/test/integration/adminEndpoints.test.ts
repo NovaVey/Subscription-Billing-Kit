@@ -6,7 +6,7 @@ const { db, pool } = await import('../../src/db/client.js');
 const { customers, dunningState, invoices, subscriptionItems, subscriptions, webhookEvents } = await import(
   '../../src/db/schema.js'
 );
-const { fakeCustomer, fakeSubscription, fakeSubscriptionItem } = await import('./helpers/stripeFixtures.js');
+const { fakeCustomer, fakePrice, fakeSubscription, fakeSubscriptionItem } = await import('./helpers/stripeFixtures.js');
 const { WRITE_KEY_HEADERS } = await import('./helpers/adminAuth.js');
 
 const app = buildApp();
@@ -172,6 +172,72 @@ describe('GET /subscriptions', () => {
     const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=0', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(400);
   });
+
+  it('computes mrrMinor by normalizing each item to a monthly-equivalent amount before summing, not by summing raw amounts', async () => {
+    const { id: customerId } = await seedCustomer();
+    const stripeSubscription = fakeSubscription({ items: { data: [] } });
+    const [row] = await db
+      .insert(subscriptions)
+      .values({
+        customerId,
+        stripeSubscriptionId: stripeSubscription.id,
+        status: 'active',
+        planCode: 'starter',
+        currency: 'usd',
+        cancelAtPeriodEnd: false,
+      })
+      .returning({ id: subscriptions.id });
+    const subscriptionId = row!.id;
+    cleanupSubscriptionIds.push(subscriptionId);
+
+    const annualItem = fakeSubscriptionItem({
+      quantity: 2,
+      price: fakePrice({ unit_amount: 29000, recurring: { interval: 'year', interval_count: 1 } }),
+    });
+    const weeklyItem = fakeSubscriptionItem({
+      quantity: 1,
+      price: fakePrice({ unit_amount: 500, recurring: { interval: 'week', interval_count: 1 } }),
+    });
+
+    await db.insert(subscriptionItems).values([
+      {
+        subscriptionId,
+        stripeItemId: annualItem.id,
+        priceId: annualItem.price.id,
+        quantity: annualItem.quantity,
+        unitAmountMinor: annualItem.price.unit_amount,
+        currency: annualItem.price.currency,
+        recurringInterval: annualItem.price.recurring.interval,
+        currentPeriodStart: new Date(annualItem.current_period_start * 1000),
+        currentPeriodEnd: new Date(annualItem.current_period_end * 1000),
+      },
+      {
+        subscriptionId,
+        stripeItemId: weeklyItem.id,
+        priceId: weeklyItem.price.id,
+        quantity: weeklyItem.quantity,
+        unitAmountMinor: weeklyItem.price.unit_amount,
+        currency: weeklyItem.price.currency,
+        recurringInterval: weeklyItem.price.recurring.interval,
+        currentPeriodStart: new Date(weeklyItem.current_period_start * 1000),
+        currentPeriodEnd: new Date(weeklyItem.current_period_end * 1000),
+      },
+    ]);
+
+    const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=100', headers: WRITE_KEY_HEADERS });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const row2 = body.subscriptions.find((s: { id: string }) => s.id === subscriptionId);
+    expect(row2).toBeDefined();
+    // Hand-computed: annual item at 29000 minor * qty 2, divided by 12; plus
+    // weekly item at 500 minor * qty 1, scaled by 52/12 - each rounded on its
+    // own, not the raw combined amount (29000*2 + 500 = 58500). This also
+    // pins the rounding order: summing the unrounded terms and rounding once
+    // at the end happens to agree with rounding each term first for these
+    // particular numbers, so either implementation choice passes here.
+    const expectedMrrMinor = Math.round((29000 * 2) / 12) + Math.round((500 * 52) / 12);
+    expect(row2.mrrMinor).toBe(expectedMrrMinor);
+  });
 });
 
 describe('GET /subscriptions/:id', () => {
@@ -194,6 +260,90 @@ describe('GET /subscriptions/:id', () => {
     const response = await app.inject({ method: 'GET', url: `/subscriptions/${subscriptionId}`, headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(200);
     expect(response.json().dunning.stage).toBe(2);
+  });
+});
+
+describe('subscription mutation routes: unknown id', () => {
+  it('returns 404 from GET /subscriptions/:id, GET /subscriptions/:id/preview, POST /subscriptions/:id/plan, and POST /subscriptions/:id/cancel', async () => {
+    const unknownId = '00000000-0000-0000-0000-000000000099';
+
+    const detail = await app.inject({ method: 'GET', url: `/subscriptions/${unknownId}`, headers: WRITE_KEY_HEADERS });
+    expect(detail.statusCode).toBe(404);
+
+    const preview = await app.inject({
+      method: 'GET',
+      url: `/subscriptions/${unknownId}/preview?price_id=price_x&quantity=1`,
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(preview.statusCode).toBe(404);
+
+    const plan = await app.inject({
+      method: 'POST',
+      url: `/subscriptions/${unknownId}/plan`,
+      headers: WRITE_KEY_HEADERS,
+      payload: { price_id: 'price_x', quantity: 1 },
+    });
+    expect(plan.statusCode).toBe(404);
+
+    const cancel = await app.inject({
+      method: 'POST',
+      url: `/subscriptions/${unknownId}/cancel`,
+      headers: WRITE_KEY_HEADERS,
+      payload: { at_period_end: true },
+    });
+    expect(cancel.statusCode).toBe(404);
+  });
+});
+
+describe('subscription mutation routes: fully churned subscription (no active item)', () => {
+  it('returns 409 from GET /subscriptions/:id/preview and POST /subscriptions/:id/plan without ever calling Stripe', async () => {
+    const { id: customerId } = await seedCustomer();
+    const stripeSubscription = fakeSubscription({ items: { data: [] } });
+    const [row] = await db
+      .insert(subscriptions)
+      .values({
+        customerId,
+        stripeSubscriptionId: stripeSubscription.id,
+        status: 'active',
+        planCode: 'starter',
+        currency: 'usd',
+        cancelAtPeriodEnd: false,
+      })
+      .returning({ id: subscriptions.id });
+    const subscriptionId = row!.id;
+    cleanupSubscriptionIds.push(subscriptionId);
+
+    const item = fakeSubscriptionItem();
+    await db.insert(subscriptionItems).values({
+      subscriptionId,
+      stripeItemId: item.id,
+      priceId: item.price.id,
+      quantity: 1,
+      unitAmountMinor: item.price.unit_amount,
+      currency: item.price.currency,
+      recurringInterval: item.price.recurring.interval,
+      currentPeriodStart: new Date(item.current_period_start * 1000),
+      currentPeriodEnd: new Date(item.current_period_end * 1000),
+      // Fully churned: the only item row is soft-removed, so
+      // loadActiveItem() finds nothing and the route must 409 before ever
+      // reaching stripe.invoices.createPreview / stripe.subscriptions.update.
+      removedAt: new Date(),
+    });
+
+    const preview = await app.inject({
+      method: 'GET',
+      url: `/subscriptions/${subscriptionId}/preview?price_id=price_x&quantity=1`,
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(preview.statusCode).toBe(409);
+
+    const plan = await app.inject({
+      method: 'POST',
+      url: `/subscriptions/${subscriptionId}/plan`,
+      headers: WRITE_KEY_HEADERS,
+      payload: { price_id: 'price_x', quantity: 1 },
+    });
+    expect(plan.statusCode).toBe(409);
   });
 });
 

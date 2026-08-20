@@ -69,4 +69,33 @@ describe('money', () => {
       expect(() => addSameCurrency([])).toThrow();
     });
   });
+
+  describe('the exact half-cent rounding boundary', () => {
+    it('pins the current rounding direction for toMinor at +19.995', () => {
+      // 19.995 * 100 is exactly 1999.5 in floating point, and Math.round
+      // rounds half-way values toward +Infinity, so this rounds UP to
+      // 2000 (i.e. $20.00, not $19.99). This test pins today's deliberate
+      // behavior so an accidental change to the rounding logic is caught.
+      expect(toMinor(19.995, 'usd')).toBe(2000);
+    });
+
+    it('pins the current rounding direction for toMinor at -19.995', () => {
+      // -19.995 * 100 is exactly -1999.5. Math.round still rounds
+      // half-way values toward +Infinity, so this rounds toward zero to
+      // -1999 (i.e. -$19.99) rather than away from zero to -2000 —
+      // asymmetric with the +19.995 case above. Pinning the current
+      // behavior here, not asserting it is the "correct" direction.
+      expect(toMinor(-19.995, 'usd')).toBe(-1999);
+    });
+  });
+
+  describe('negative amounts (refunds / proration credits)', () => {
+    it('nets a negative line against positive charges instead of mishandling or rejecting it', () => {
+      const result = addSameCurrency([
+        { amountMinor: 2900, currency: 'usd' },
+        { amountMinor: -900, currency: 'usd' },
+      ]);
+      expect(result).toEqual({ amountMinor: 2000, currency: 'usd' });
+    });
+  });
 });

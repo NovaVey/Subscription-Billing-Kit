@@ -74,4 +74,65 @@ describe('computeYesterdayWindow bounds "yesterday" explicitly in the given time
     expect(utcWindow.start.toISOString()).not.toBe(nyWindow.start.toISOString());
     expect(nyWindow.end.getTime() - nyWindow.start.getTime()).toBe(24 * 60 * 60 * 1000);
   });
+
+  it('on the spring-forward transition day, does not stretch/shrink to the 23-hour local day - it stays a fixed 24h and bleeds into the day before', () => {
+    // 2026-03-08 is the US spring-forward day: America/New_York jumps from
+    // EST (UTC-5) to EDT (UTC-4) at 02:00 local, so the true local day is
+    // only 23 wall-clock hours long (00:00 EST -> 00:00 EDT the next day).
+    // `now` is the day after, so "yesterday" is the transition day itself.
+    const now = new Date('2026-03-09T12:00:00.000Z');
+    const { start, end } = computeYesterdayWindow('America/New_York', now);
+
+    // `end` is derived using "today"'s (post-transition) EDT offset and
+    // correctly lands on true local midnight, 2026-03-09T00:00:00 EDT.
+    expect(end.toISOString()).toBe('2026-03-09T04:00:00.000Z');
+
+    // `start` is just `end` minus a flat 24h, so it also uses EDT (-4)
+    // rather than the EST (-5) offset actually in effect at the start of
+    // March 8th. True local midnight for March 8th (EST) converts to
+    // 2026-03-08T05:00:00.000Z; the computed start lands an hour earlier,
+    // at 2026-03-08T04:00:00.000Z - which is 23:00 on March 7th in New
+    // York, not midnight of the 8th. This is exactly the DST-boundary edge
+    // case named in computeYesterdayWindow's own comment: because the
+    // window is a fixed 24h rather than the true 23-hour local day, it
+    // pulls in the last hour of March 7th's invoices as if they were part
+    // of "yesterday".
+    expect(start.toISOString()).toBe('2026-03-08T04:00:00.000Z');
+    expect(start.toISOString()).not.toBe('2026-03-08T05:00:00.000Z'); // true local midnight of the 8th
+
+    // The window length is unconditionally 24h - it's computed as
+    // `end - 24h`, never re-derived from the target timezone's actual
+    // (here, 23-hour) civil day, so a DST spring-forward never shrinks it.
+    expect(end.getTime() - start.getTime()).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it('on the fall-back transition day, does not stretch to the 25-hour local day - it stays a fixed 24h and misses the first local hour', () => {
+    // 2026-11-01 is the US fall-back day: America/New_York drops from EDT
+    // (UTC-4) to EST (UTC-5) at 02:00 local, so the true local day is 25
+    // wall-clock hours long. `now` is the day after, so "yesterday" is the
+    // transition day itself.
+    const now = new Date('2026-11-02T12:00:00.000Z');
+    const { start, end } = computeYesterdayWindow('America/New_York', now);
+
+    // `end` is derived using "today"'s (post-transition) EST offset and
+    // correctly lands on true local midnight, 2026-11-02T00:00:00 EST.
+    expect(end.toISOString()).toBe('2026-11-02T05:00:00.000Z');
+
+    // `start` is just `end` minus a flat 24h, so it also uses EST (-5)
+    // rather than the EDT (-4) offset actually in effect at the start of
+    // November 1st. True local midnight for November 1st (EDT) converts to
+    // 2026-11-01T04:00:00.000Z; the computed start lands an hour later, at
+    // 2026-11-01T05:00:00.000Z - which is 01:00 on November 1st in New
+    // York, not midnight. So the window misses the 00:00-01:00 EDT hour of
+    // "yesterday" - the same known DST-boundary edge case named in
+    // computeYesterdayWindow's own comment, here dropping an hour of
+    // invoices rather than double-counting one.
+    expect(start.toISOString()).toBe('2026-11-01T05:00:00.000Z');
+    expect(start.toISOString()).not.toBe('2026-11-01T04:00:00.000Z'); // true local midnight of the 1st
+
+    // The window length is unconditionally 24h - it's computed as
+    // `end - 24h`, never re-derived from the target timezone's actual
+    // (here, 25-hour) civil day, so a DST fall-back never stretches it.
+    expect(end.getTime() - start.getTime()).toBe(24 * 60 * 60 * 1000);
+  });
 });
