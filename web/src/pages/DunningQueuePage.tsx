@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { getDunningQueue, resolveDunning } from '../lib/api';
 import type { DunningQueueRow } from '../lib/types';
@@ -7,44 +7,33 @@ import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { Modal } from '../components/Modal';
 import { formatTimestamp, truncateId } from '../lib/format';
 import { useToast } from '../components/Toast';
+import { useAsyncAction, useAsyncData } from '../lib/hooks';
 
 const RESOLUTIONS = ['recovered', 'canceled', 'manual'] as const;
 
 export function DunningQueuePage() {
   const { notify } = useToast();
-  const [rows, setRows] = useState<DunningQueueRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, reload } = useAsyncData(getDunningQueue, []);
+  const rows = data?.queue ?? [];
   const [resolveTarget, setResolveTarget] = useState<DunningQueueRow | null>(null);
   const [resolution, setResolution] = useState<(typeof RESOLUTIONS)[number]>('recovered');
   const [note, setNote] = useState('');
-  const [busy, setBusy] = useState(false);
 
-  function reload() {
-    setLoading(true);
-    setError(null);
-    getDunningQueue()
-      .then((res) => setRows(res.queue))
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }
+  const { run, busy } = useAsyncAction();
 
-  useEffect(reload, []);
-
-  async function handleResolve() {
+  function handleResolve() {
     if (!resolveTarget || !note.trim()) return;
-    setBusy(true);
-    try {
-      await resolveDunning(resolveTarget.subscriptionId, { resolution, note });
-      notify('Resolved');
-      setResolveTarget(null);
-      setNote('');
-      reload();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Resolve failed', 'alert');
-    } finally {
-      setBusy(false);
-    }
+    void run(async () => {
+      try {
+        await resolveDunning(resolveTarget.subscriptionId, { resolution, note });
+        notify('Resolved');
+        setResolveTarget(null);
+        setNote('');
+        reload();
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Resolve failed', 'alert');
+      }
+    });
   }
 
   if (loading) return <LoadingState />;

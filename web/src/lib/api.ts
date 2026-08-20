@@ -1,10 +1,12 @@
 import type {
   DunningQueueResponse,
   InvoiceListResponse,
+  ReconciliationRunDetail,
   ReconciliationRunListResponse,
   ReconciliationRunResult,
   SubscriptionDetailResponse,
   SubscriptionListResponse,
+  WebhookEventDetail,
   WebhookEventListResponse,
 } from './types';
 import { clearAdminKey, getAdminKey } from './adminKey';
@@ -145,8 +147,20 @@ export function replayWebhookEvent(id: string): Promise<{ stripeEventId: string;
   return request(`/admin/webhook-events/${id}/replay`, { method: 'POST' });
 }
 
+// Fetched on demand when a single row is expanded - the list response no
+// longer carries `payload` (§ efficiency: /improve audit).
+export function getWebhookEvent(id: string): Promise<WebhookEventDetail> {
+  return request(`/admin/webhook-events/${id}`);
+}
+
 export function listReconciliationRuns(): Promise<ReconciliationRunListResponse> {
   return request('/admin/reconciliation');
+}
+
+// Fetched on demand when a single run is drilled into - the list response no
+// longer carries `report` (§ efficiency: /improve audit).
+export function getReconciliationRun(id: string): Promise<ReconciliationRunDetail> {
+  return request(`/admin/reconciliation/${id}`);
 }
 
 export function runReconciliation(body: {

@@ -4,12 +4,8 @@ import { stripe } from '../../stripe/client.js';
 import { db } from '../../db/client.js';
 import { invoices, paymentAttempts } from '../../db/schema.js';
 import { logger } from '../../lib/logger.js';
+import { resolveId } from '../../stripe/refs.js';
 import type { HandlerResult } from './customer.js';
-
-function resolveId(ref: string | { id: string } | null | undefined): string | undefined {
-  if (!ref) return undefined;
-  return typeof ref === 'string' ? ref : ref.id;
-}
 
 // As of this pinned API version, PaymentIntent has no `invoice` field at
 // all (older integrations widely assume `paymentIntent.invoice` exists —

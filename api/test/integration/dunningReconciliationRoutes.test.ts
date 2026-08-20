@@ -248,6 +248,71 @@ describe('GET /admin/reconciliation', () => {
     const ids = response.json().runs.map((r: { id: string }) => r.id);
     expect(ids.indexOf(newer!.id)).toBeLessThan(ids.indexOf(older!.id));
   });
+
+  it('omits `report` from every row - fetched separately via the detail route', async () => {
+    const [row] = await db
+      .insert(reconciliationRuns)
+      .values({
+        periodStart: new Date('2026-04-04T00:00:00Z'),
+        periodEnd: new Date('2026-04-05T00:00:00Z'),
+        currency: 'usd',
+        stripeTotalMinor: 500,
+        localTotalMinor: 500,
+        invoiceCountStripe: 1,
+        invoiceCountLocal: 1,
+        mismatchCount: 1,
+        report: [{ type: 'orphan_local', stripeInvoiceId: 'in_orphan' }],
+      })
+      .returning({ id: reconciliationRuns.id });
+    cleanupRunIds.push(row!.id);
+
+    const response = await app.inject({ method: 'GET', url: '/admin/reconciliation', headers: WRITE_KEY_HEADERS });
+    const body = response.json();
+    expect(body.runs.length).toBeGreaterThan(0);
+    for (const run of body.runs) {
+      expect(run).not.toHaveProperty('report');
+    }
+  });
+});
+
+describe('GET /admin/reconciliation/:id', () => {
+  it('returns the full row, including report', async () => {
+    const report = [{ type: 'field_drift' as const, stripeInvoiceId: 'in_drift', field: 'status', stripeValue: 'paid', localValue: 'open' }];
+    const [row] = await db
+      .insert(reconciliationRuns)
+      .values({
+        periodStart: new Date('2026-04-06T00:00:00Z'),
+        periodEnd: new Date('2026-04-07T00:00:00Z'),
+        currency: 'usd',
+        stripeTotalMinor: 900,
+        localTotalMinor: 900,
+        invoiceCountStripe: 1,
+        invoiceCountLocal: 1,
+        mismatchCount: 1,
+        report,
+      })
+      .returning({ id: reconciliationRuns.id });
+    cleanupRunIds.push(row!.id);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/admin/reconciliation/${row!.id}`,
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.id).toBe(row!.id);
+    expect(body.report).toEqual(report);
+  });
+
+  it('returns 404 for an unknown run id', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/admin/reconciliation/00000000-0000-0000-0000-000000000000',
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(404);
+  });
 });
 
 describe('POST /admin/reconciliation/run', () => {

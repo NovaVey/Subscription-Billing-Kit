@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { customers, invoices } from '../db/schema.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const ListQuery = z.object({
   customer_id: z.uuid().optional(),
@@ -13,11 +14,9 @@ const ListQuery = z.object({
 export async function invoiceRoutes(app: FastifyInstance) {
   // ?customer_id=&status= (§6)
   app.get('/invoices', async (req, reply) => {
-    const parsed = ListQuery.safeParse(req.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { customer_id, status, limit } = parsed.data;
+    const query = parseOrReply(ListQuery, req.query, reply);
+    if (!query) return;
+    const { customer_id, status, limit } = query;
 
     const conditions = [];
     if (customer_id) conditions.push(eq(invoices.customerId, customer_id));

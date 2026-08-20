@@ -13,6 +13,7 @@ const { customers, subscriptionItems, subscriptionEvents, subscriptions, webhook
   '../../src/db/schema.js'
 );
 const { processPendingWebhookEvents } = await import('../../src/webhooks/processor.js');
+const { syncCustomerFromStripe } = await import('../../src/stripe/sync.js');
 const { fakeCustomer, fakeEvent, fakeSubscription, fakeSubscriptionItem } = await import(
   './helpers/stripeFixtures.js'
 );
@@ -249,5 +250,79 @@ describe('an event that arrives late does not overwrite newer state', () => {
       .where(eq(webhookEvents.stripeEventId, staleEvent.id));
     expect(staleRow?.status).toBe('skipped');
     expect(mockRetrieve).toHaveBeenCalledTimes(2); // only the two in-order events
+  });
+});
+
+describe('an unexpected state transition is still applied and logged - Stripe is always the source of truth', () => {
+  it('projects a status the EXPECTED_TRANSITIONS table does not list for the prior status, and records it', async () => {
+    const c = fakeCustomer();
+    await seedCustomer(c.id);
+
+    const stripeSubscriptionId = 'sub_test_unexpectedtransition';
+    const activeSnapshot = fakeSubscription({
+      id: stripeSubscriptionId,
+      customer: c.id,
+      status: 'active',
+    });
+    mockRetrieve.mockResolvedValueOnce(activeSnapshot);
+    await insertReceivedEvent(fakeEvent('customer.subscription.created', activeSnapshot));
+    await processPendingWebhookEvents();
+
+    const [afterCreate] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    expect(afterCreate?.status).toBe('active');
+    cleanupSubscriptionIds.push(afterCreate!.id);
+
+    // EXPECTED_TRANSITIONS['active'] only lists past_due, canceled, paused,
+    // unpaid - 'trialing' is not in that set, so active -> trialing is
+    // genuinely unexpected. It must still be applied and logged, not
+    // silently dropped or blocked.
+    const trialingSnapshot = fakeSubscription({
+      id: stripeSubscriptionId,
+      customer: c.id,
+      status: 'trialing',
+    });
+    mockRetrieve.mockResolvedValueOnce(trialingSnapshot);
+    await insertReceivedEvent(fakeEvent('customer.subscription.updated', trialingSnapshot));
+    await processPendingWebhookEvents();
+
+    const [afterUpdate] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    // Stripe wins - the row is updated even though the transition is not
+    // "expected".
+    expect(afterUpdate?.status).toBe('trialing');
+
+    const events = await db
+      .select()
+      .from(subscriptionEvents)
+      .where(eq(subscriptionEvents.subscriptionId, afterUpdate!.id));
+    const transitionEvent = events.find((e) => e.toStatus === 'trialing');
+    expect(transitionEvent).toBeDefined();
+    expect(transitionEvent?.fromStatus).toBe('active');
+    expect(transitionEvent?.reason).toBe('customer.subscription.updated');
+  });
+});
+
+describe('syncCustomerFromStripe preserves external_ref on a blank re-sync', () => {
+  it('does not overwrite an existing externalRef when a later sync has no metadata.external_ref key', async () => {
+    const original = fakeCustomer({ metadata: { external_ref: 'org_blank_resync' } });
+    const { id: customerId } = await syncCustomerFromStripe(original as never);
+    cleanupCustomerIds.push(customerId);
+
+    const [afterFirst] = await db.select().from(customers).where(eq(customers.id, customerId));
+    expect(afterFirst?.externalRef).toBe('org_blank_resync');
+
+    // Same Stripe customer id, but metadata carries no external_ref key at
+    // all - a bare re-sync (e.g. triggered by an unrelated field changing).
+    const blankResync = fakeCustomer({ id: original.id, metadata: {} });
+    await syncCustomerFromStripe(blankResync as never);
+
+    const [afterSecond] = await db.select().from(customers).where(eq(customers.id, customerId));
+    // Still the original value - never overwritten with a blank.
+    expect(afterSecond?.externalRef).toBe('org_blank_resync');
   });
 });

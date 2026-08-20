@@ -23,7 +23,9 @@ const ADMIN_GET_ROUTES = [
   { method: 'GET' as const, url: '/invoices' },
   { method: 'GET' as const, url: '/dunning/queue' },
   { method: 'GET' as const, url: '/admin/reconciliation' },
+  { method: 'GET' as const, url: '/admin/reconciliation/00000000-0000-0000-0000-000000000000' },
   { method: 'GET' as const, url: '/admin/webhook-events' },
+  { method: 'GET' as const, url: '/admin/webhook-events/evt_does_not_exist' },
 ];
 
 const ADMIN_MUTATING_ROUTES = [

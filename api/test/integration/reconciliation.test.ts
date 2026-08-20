@@ -191,3 +191,42 @@ describe('a clean period stores a zero-mismatch run', () => {
     expect(storedRun?.invoiceCountLocal).toBe(1);
   });
 });
+
+describe('adjacent-reconciliation-windows-do-not-double-count-an-invoice-on-a-shared-boundary', () => {
+  it('counts a Stripe invoice created exactly on a shared boundary in exactly one of two back-to-back runs', async () => {
+    const dayStart = new Date('2026-05-06T00:00:00.000Z');
+    const boundary = new Date('2026-05-06T12:00:00.000Z');
+    const dayEnd = new Date('2026-05-07T00:00:00.000Z');
+    const boundaryInvoice = fakeInvoice({ status: 'paid', created: Math.floor(boundary.getTime() / 1000) });
+
+    // Unlike the other tests' unconditional mockReturnValue, this mock
+    // actually honors the passed gte/lt(e) params on `created`, the same
+    // way Stripe's real API does - the bug this guards against (runReconciliation
+    // previously used an inclusive `lte` on periodEnd, asymmetric with the
+    // local query's `lt`) only shows up when the filter is respected at a
+    // shared boundary.
+    mockInvoicesList.mockImplementation(
+      ({ created }: { created: { gte?: number; gt?: number; lte?: number; lt?: number } }) =>
+        [boundaryInvoice].filter((inv) => {
+          if (created.gte !== undefined && inv.created < created.gte) return false;
+          if (created.gt !== undefined && inv.created <= created.gt) return false;
+          if (created.lte !== undefined && inv.created > created.lte) return false;
+          if (created.lt !== undefined && inv.created >= created.lt) return false;
+          return true;
+        }),
+    );
+
+    const morningRun = await runReconciliation({ periodStart: dayStart, periodEnd: boundary, currency: 'usd' });
+    cleanupRunIds.push(morningRun.runId);
+    const afternoonRun = await runReconciliation({ periodStart: boundary, periodEnd: dayEnd, currency: 'usd' });
+    cleanupRunIds.push(afternoonRun.runId);
+
+    // The afternoon window's lower bound is `gte boundary`, so it owns the
+    // boundary invoice. The morning window's upper bound must be `lt
+    // boundary`, not `lte`, so it must NOT also claim the same invoice -
+    // that asymmetry is exactly what double-counted an invoice across two
+    // adjacent runs before the fix.
+    expect(morningRun.invoiceCountStripe).toBe(0);
+    expect(afternoonRun.invoiceCountStripe).toBe(1);
+  });
+});

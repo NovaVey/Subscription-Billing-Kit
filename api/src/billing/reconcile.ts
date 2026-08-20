@@ -165,9 +165,16 @@ export interface RunReconciliationResult extends ClassifiedReconciliation {
 export async function runReconciliation(input: RunReconciliationInput): Promise<RunReconciliationResult> {
   const currency = input.currency.toLowerCase();
 
+  // Half-open on both sides ([periodStart, periodEnd)), matching the local
+  // query below exactly - an invoice landing on a shared boundary between
+  // two adjacent runs (e.g. back-to-back nightly windows) must count in
+  // exactly one run on both sides, not be double-counted on the Stripe side
+  // while single-counted locally (or vice versa). This was previously `lte`
+  // on periodEnd, which broke that invariant at the boundary - see the
+  // /improve audit.
   const stripeInvoices: ReconciliationInvoiceSnapshot[] = [];
   for await (const invoice of stripe.invoices.list({
-    created: { gte: toStripeSeconds(input.periodStart), lte: toStripeSeconds(input.periodEnd) },
+    created: { gte: toStripeSeconds(input.periodStart), lt: toStripeSeconds(input.periodEnd) },
     limit: 100,
   })) {
     if (invoice.currency.toLowerCase() !== currency) continue;

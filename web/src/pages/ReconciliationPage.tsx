@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react';
-import { listReconciliationRuns, runReconciliation } from '../lib/api';
-import type { ReconciliationReportEntry, ReconciliationRun } from '../lib/types';
+import { useState } from 'react';
+import { getReconciliationRun, listReconciliationRuns, runReconciliation } from '../lib/api';
+import type { ReconciliationReportEntry, ReconciliationRun, ReconciliationRunDetail } from '../lib/types';
 import { Amount } from '../components/Amount';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { formatTimestamp } from '../lib/format';
 import { useToast } from '../components/Toast';
+import { useAsyncAction, useAsyncData } from '../lib/hooks';
 
 function mismatchBreakdown(report: ReconciliationReportEntry[]): string {
   if (report.length === 0) return 'zero mismatches';
@@ -18,59 +19,62 @@ function mismatchBreakdown(report: ReconciliationReportEntry[]): string {
 
 export function ReconciliationPage() {
   const { notify } = useToast();
-  const [runs, setRuns] = useState<ReconciliationRun[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<ReconciliationRun | null>(null);
+  const { data, loading, error, reload } = useAsyncData(listReconciliationRuns, []);
+  const runs = data?.runs ?? [];
+  const [selected, setSelected] = useState<ReconciliationRunDetail | null>(null);
+  const [drillingIn, setDrillingIn] = useState<string | null>(null);
 
   const [periodStart, setPeriodStart] = useState('');
   const [periodEnd, setPeriodEnd] = useState('');
   const [currency, setCurrency] = useState('usd');
-  const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
 
-  function reload() {
-    setLoading(true);
-    setError(null);
-    listReconciliationRuns()
-      .then((res) => setRuns(res.runs))
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
+  // The list response no longer carries `report` - fetch the full row on
+  // demand only when an operator actually drills into it.
+  async function handleDrillIn(run: ReconciliationRun) {
+    setDrillingIn(run.id);
+    try {
+      const detail = await getReconciliationRun(run.id);
+      setSelected(detail);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Could not load run detail', 'alert');
+    } finally {
+      setDrillingIn(null);
+    }
   }
 
-  useEffect(reload, []);
+  const { run, busy: running } = useAsyncAction();
 
-  async function handleRun() {
+  function handleRun() {
     if (!periodStart || !periodEnd || !currency) return;
-    setRunning(true);
-    setRunError(null);
-    try {
-      const result = await runReconciliation({
-        period_start: new Date(periodStart).toISOString(),
-        period_end: new Date(periodEnd).toISOString(),
-        currency,
-      });
-      notify('Reconciliation run complete');
-      setSelected({
-        id: result.runId,
-        periodStart: new Date(periodStart).toISOString(),
-        periodEnd: new Date(periodEnd).toISOString(),
-        ranAt: new Date().toISOString(),
-        currency,
-        stripeTotalMinor: result.stripeTotalMinor,
-        localTotalMinor: result.localTotalMinor,
-        invoiceCountStripe: result.invoiceCountStripe,
-        invoiceCountLocal: result.invoiceCountLocal,
-        mismatchCount: result.mismatchCount,
-        report: result.entries,
-      });
-      reload();
-    } catch (err) {
-      setRunError(err instanceof Error ? err.message : String(err));
-      notify('Reconciliation run failed', 'alert');
-    } finally {
-      setRunning(false);
-    }
+    void run(async () => {
+      setRunError(null);
+      try {
+        const result = await runReconciliation({
+          period_start: new Date(periodStart).toISOString(),
+          period_end: new Date(periodEnd).toISOString(),
+          currency,
+        });
+        notify('Reconciliation run complete');
+        setSelected({
+          id: result.runId,
+          periodStart: new Date(periodStart).toISOString(),
+          periodEnd: new Date(periodEnd).toISOString(),
+          ranAt: new Date().toISOString(),
+          currency,
+          stripeTotalMinor: result.stripeTotalMinor,
+          localTotalMinor: result.localTotalMinor,
+          invoiceCountStripe: result.invoiceCountStripe,
+          invoiceCountLocal: result.invoiceCountLocal,
+          mismatchCount: result.mismatchCount,
+          report: result.entries,
+        });
+        reload();
+      } catch (err) {
+        setRunError(err instanceof Error ? err.message : String(err));
+        notify('Reconciliation run failed', 'alert');
+      }
+    });
   }
 
   return (
@@ -163,10 +167,11 @@ export function ReconciliationPage() {
                   <td className="py-2 pr-4 text-right">
                     <button
                       type="button"
-                      onClick={() => setSelected(run)}
-                      className="border border-ink px-2 py-1 text-xs hover:bg-ink hover:text-paper"
+                      disabled={drillingIn === run.id}
+                      onClick={() => handleDrillIn(run)}
+                      className="border border-ink px-2 py-1 text-xs hover:bg-ink hover:text-paper disabled:opacity-50"
                     >
-                      Drill in
+                      {drillingIn === run.id ? 'Loading…' : 'Drill in'}
                     </button>
                   </td>
                 </tr>

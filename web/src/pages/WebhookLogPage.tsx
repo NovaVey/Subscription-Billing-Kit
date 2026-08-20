@@ -1,10 +1,11 @@
-import { Fragment, useEffect, useState } from 'react';
-import { listWebhookEvents, replayWebhookEvent } from '../lib/api';
+import { Fragment, useState } from 'react';
+import { getWebhookEvent, listWebhookEvents, replayWebhookEvent } from '../lib/api';
 import type { WebhookEvent } from '../lib/types';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { formatTimestamp } from '../lib/format';
 import { useToast } from '../components/Toast';
+import { useAsyncData } from '../lib/hooks';
 
 const STATUS_OPTIONS = ['', 'received', 'processing', 'processed', 'failed', 'skipped'];
 
@@ -21,22 +22,15 @@ export function WebhookLogPage() {
   const [status, setStatus] = useState('');
   const [type, setType] = useState('');
   const [appliedType, setAppliedType] = useState('');
-  const [rows, setRows] = useState<WebhookEvent[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, reload } = useAsyncData(
+    () => listWebhookEvents({ status: status || undefined, type: appliedType || undefined, limit: 100 }),
+    [status, appliedType],
+  );
+  const rows = data?.events ?? [];
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [payloads, setPayloads] = useState<Record<string, Record<string, unknown>>>({});
+  const [loadingPayload, setLoadingPayload] = useState<string | null>(null);
   const [replaying, setReplaying] = useState<string | null>(null);
-
-  function reload() {
-    setLoading(true);
-    setError(null);
-    listWebhookEvents({ status: status || undefined, type: appliedType || undefined, limit: 100 })
-      .then((res) => setRows(res.events))
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(reload, [status, appliedType]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -45,6 +39,16 @@ export function WebhookLogPage() {
       else next.add(id);
       return next;
     });
+    // The list response no longer carries `payload` - fetch it once, on
+    // first expand, and cache it locally so re-collapsing/re-expanding the
+    // same row doesn't re-fetch.
+    if (!expanded.has(id) && !(id in payloads)) {
+      setLoadingPayload(id);
+      getWebhookEvent(id)
+        .then((detail) => setPayloads((prev) => ({ ...prev, [id]: detail.payload })))
+        .catch((err: Error) => notify(err.message, 'alert'))
+        .finally(() => setLoadingPayload((current) => (current === id ? null : current)));
+    }
   }
 
   async function handleReplay(id: string) {
@@ -153,9 +157,13 @@ export function WebhookLogPage() {
                 {expanded.has(event.stripeEventId) && (
                   <tr className="border-b border-rule">
                     <td colSpan={7} className="bg-ink/[0.03] p-4">
-                      <pre className="num max-h-80 overflow-auto whitespace-pre-wrap text-xs">
-                        {JSON.stringify(event.payload, null, 2)}
-                      </pre>
+                      {loadingPayload === event.stripeEventId && !(event.stripeEventId in payloads) ? (
+                        <p className="text-xs text-ink/60">Loading payload…</p>
+                      ) : (
+                        <pre className="num max-h-80 overflow-auto whitespace-pre-wrap text-xs">
+                          {JSON.stringify(payloads[event.stripeEventId], null, 2)}
+                        </pre>
+                      )}
                     </td>
                   </tr>
                 )}

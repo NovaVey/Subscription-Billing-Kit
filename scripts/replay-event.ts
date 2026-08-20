@@ -5,9 +5,8 @@
 // the same reset semantics are still wanted: a clean received state with a
 // fresh attempt budget, distinct from the automatic backoff/retry counter
 // (§5.7). Same underlying update as routes/webhookEvents.ts's replay route.
-import { eq } from 'drizzle-orm';
-import { pool, db } from '../api/src/db/client.js';
-import { webhookEvents } from '../api/src/db/schema.js';
+import { pool } from '../api/src/db/client.js';
+import { resetWebhookEventForReplay } from '../api/src/webhooks/ledger.js';
 
 async function main() {
   const stripeEventId = process.argv[2];
@@ -17,24 +16,12 @@ async function main() {
     return;
   }
 
-  const [existing] = await db.select().from(webhookEvents).where(eq(webhookEvents.stripeEventId, stripeEventId));
-  if (!existing) {
+  const ok = await resetWebhookEventForReplay(stripeEventId);
+  if (!ok) {
     console.error(`[replay-event] no webhook_events row for ${stripeEventId}`);
     process.exitCode = 1;
     return;
   }
-
-  await db
-    .update(webhookEvents)
-    .set({
-      status: 'received',
-      attempts: 0,
-      nextAttemptAt: null,
-      processingStartedAt: null,
-      processedAt: null,
-      lastError: null,
-    })
-    .where(eq(webhookEvents.stripeEventId, stripeEventId));
 
   console.log(`[replay-event] ${stripeEventId} reset to 'received' - the next processor tick will pick it up`);
 }

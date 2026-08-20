@@ -1,4 +1,4 @@
-import { and, eq, isNull, notInArray } from 'drizzle-orm';
+import { and, eq, isNull, notInArray, sql } from 'drizzle-orm';
 import type Stripe from 'stripe';
 import { db, type Executor } from '../db/client.js';
 import { customers, subscriptionItems, subscriptions } from '../db/schema.js';
@@ -92,23 +92,19 @@ async function projectSubscription(
 
   const currentStripeItemIds = items.map((item) => item.id);
 
-  for (const item of items) {
+  // A single multi-row upsert instead of one insert-on-conflict round trip
+  // per item - this runs on every subscription webhook and every admin
+  // plan-change/cancel/resume resync, so an N-item subscription previously
+  // paid N sequential DB round trips here. `excluded.<col>` in the SET
+  // clause refers to each conflicting row's own incoming values (standard
+  // Postgres upsert), not a single shared literal. See the /improve audit.
+  if (items.length > 0) {
     await tx
       .insert(subscriptionItems)
-      .values({
-        subscriptionId: localId,
-        stripeItemId: item.id,
-        priceId: item.price.id,
-        quantity: item.quantity ?? 1,
-        unitAmountMinor: item.price.unit_amount ?? 0,
-        currency: item.price.currency,
-        recurringInterval: item.price.recurring?.interval ?? null,
-        currentPeriodStart: fromStripeSeconds(item.current_period_start),
-        currentPeriodEnd: fromStripeSeconds(item.current_period_end),
-      })
-      .onConflictDoUpdate({
-        target: subscriptionItems.stripeItemId,
-        set: {
+      .values(
+        items.map((item) => ({
+          subscriptionId: localId,
+          stripeItemId: item.id,
           priceId: item.price.id,
           quantity: item.quantity ?? 1,
           unitAmountMinor: item.price.unit_amount ?? 0,
@@ -116,6 +112,18 @@ async function projectSubscription(
           recurringInterval: item.price.recurring?.interval ?? null,
           currentPeriodStart: fromStripeSeconds(item.current_period_start),
           currentPeriodEnd: fromStripeSeconds(item.current_period_end),
+        })),
+      )
+      .onConflictDoUpdate({
+        target: subscriptionItems.stripeItemId,
+        set: {
+          priceId: sql`excluded.price_id`,
+          quantity: sql`excluded.quantity`,
+          unitAmountMinor: sql`excluded.unit_amount_minor`,
+          currency: sql`excluded.currency`,
+          recurringInterval: sql`excluded.recurring_interval`,
+          currentPeriodStart: sql`excluded.current_period_start`,
+          currentPeriodEnd: sql`excluded.current_period_end`,
           removedAt: null,
         },
       });

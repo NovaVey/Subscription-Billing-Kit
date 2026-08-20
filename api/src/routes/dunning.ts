@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { customers, dunningState, invoices, subscriptionEvents, subscriptions } from '../db/schema.js';
+import { loadSubscriptionOr404 } from '../lib/lookups.js';
+import { parseOrReply } from '../lib/validate.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -62,16 +64,12 @@ export async function dunningRoutes(app: FastifyInstance) {
   // dunning doesn't itself change subscriptions.status.
   app.post('/dunning/:id/resolve', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const parsed = ResolveBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request', details: parsed.error.flatten() });
-    }
-    const { resolution, note } = parsed.data;
+    const body = parseOrReply(ResolveBody, req.body, reply);
+    if (!body) return;
+    const { resolution, note } = body;
 
-    const [subRow] = await db.select().from(subscriptions).where(eq(subscriptions.id, id));
-    if (!subRow) {
-      return reply.code(404).send({ error: 'subscription not found' });
-    }
+    const subRow = await loadSubscriptionOr404(id, reply);
+    if (!subRow) return;
 
     const [existing] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, id));
     if (!existing) {

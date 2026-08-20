@@ -61,3 +61,5 @@ jobs:
       - run: npm run test:unit
 
       - run: npm run test:integration
+
+      - run: npm run test:web

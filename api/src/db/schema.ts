@@ -39,6 +39,10 @@ export const webhookEvents = pgTable(
     ),
     index('webhook_events_status_processing_started_idx').on(t.status, t.processingStartedAt),
     index('webhook_events_type_event_created_idx').on(t.type, t.eventCreatedAt),
+    // The three indexes above all lead with status or type - none serves
+    // GET /admin/webhook-events' default (unfiltered) view, which sorts the
+    // whole table by received_at desc. See the /improve audit.
+    index('webhook_events_received_at_idx').on(t.receivedAt),
   ],
 );
 
@@ -79,6 +83,10 @@ export const subscriptions = pgTable(
   (t) => [
     index('subscriptions_status_idx').on(t.status),
     index('subscriptions_customer_id_idx').on(t.customerId),
+    // GET /subscriptions orders every call by created_at desc and uses it as
+    // the keyset-pagination cursor column - including the default,
+    // unfiltered first page. See the /improve audit.
+    index('subscriptions_created_at_idx').on(t.createdAt),
   ],
 );
 
@@ -104,19 +112,25 @@ export const subscriptionItems = pgTable(
   (t) => [index('subscription_items_subscription_id_idx').on(t.subscriptionId)],
 );
 
-export const subscriptionEvents = pgTable('subscription_events', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  subscriptionId: uuid('subscription_id')
-    .notNull()
-    .references(() => subscriptions.id),
-  fromStatus: text('from_status'),
-  toStatus: text('to_status').notNull(),
-  reason: text('reason').notNull(), // webhook type, or 'manual:<actor>' for admin actions
-  actor: text('actor'), // set for manual actions
-  note: text('note'),
-  stripeEventId: text('stripe_event_id').references(() => webhookEvents.stripeEventId),
-  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const subscriptionEvents = pgTable(
+  'subscription_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    subscriptionId: uuid('subscription_id')
+      .notNull()
+      .references(() => subscriptions.id),
+    fromStatus: text('from_status'),
+    toStatus: text('to_status').notNull(),
+    reason: text('reason').notNull(), // webhook type, or 'manual:<actor>' for admin actions
+    actor: text('actor'), // set for manual actions
+    note: text('note'),
+    stripeEventId: text('stripe_event_id').references(() => webhookEvents.stripeEventId),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  // Queried by subscriptionId on every subscription detail page load; this
+  // table grows by one row per state transition, forever. See the /improve audit.
+  (t) => [index('subscription_events_subscription_id_idx').on(t.subscriptionId)],
+);
 
 export const invoices = pgTable(
   'invoices',
@@ -142,7 +156,14 @@ export const invoices = pgTable(
     paidAt: timestamp('paid_at', { withTimezone: true }),
     lastEventAt: timestamp('last_event_at', { withTimezone: true }),
   },
-  (t) => [index('invoices_subscription_id_status_idx').on(t.subscriptionId, t.status)],
+  (t) => [
+    index('invoices_subscription_id_status_idx').on(t.subscriptionId, t.status),
+    // GET /invoices filters by customer_id and always orders by
+    // period_start desc, neither of which the composite index above serves.
+    // See the /improve audit.
+    index('invoices_customer_id_idx').on(t.customerId),
+    index('invoices_period_start_idx').on(t.periodStart),
+  ],
 );
 
 export const paymentAttempts = pgTable('payment_attempts', {
