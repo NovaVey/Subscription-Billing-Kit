@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   applyPlanChange,
@@ -7,13 +7,13 @@ import {
   previewPlanChange,
   resumeSubscription,
 } from '../lib/api';
-import type { SubscriptionDetailResponse } from '../lib/types';
 import { Amount } from '../components/Amount';
 import { StatusTag } from '../components/StatusTag';
 import { ErrorState, LoadingState } from '../components/States';
 import { Modal } from '../components/Modal';
 import { formatTimestamp, truncateId } from '../lib/format';
 import { useToast } from '../components/Toast';
+import { useAsyncAction, useAsyncData } from '../lib/hooks';
 
 const PRORATION_OPTIONS = ['create_prorations', 'none', 'always_invoice'];
 
@@ -21,10 +21,11 @@ export function SubscriptionDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { notify } = useToast();
-  const [data, setData] = useState<SubscriptionDetailResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const { data, loading, error, reload } = useAsyncData(() => {
+    if (!id) return Promise.reject(new Error('no subscription id in route'));
+    return getSubscription(id);
+  }, [id]);
+  const { run, busy } = useAsyncAction();
   const [planModalOpen, setPlanModalOpen] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState<{ atPeriodEnd: boolean } | null>(null);
   const [priceId, setPriceId] = useState('');
@@ -34,18 +35,6 @@ export function SubscriptionDetailPage() {
     null,
   );
   const [previewError, setPreviewError] = useState<string | null>(null);
-
-  function reload() {
-    if (!id) return;
-    setLoading(true);
-    setError(null);
-    getSubscription(id)
-      .then(setData)
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(reload, [id]);
 
   async function handlePreview() {
     if (!id) return;
@@ -59,49 +48,47 @@ export function SubscriptionDetailPage() {
     }
   }
 
-  async function handleApplyPlanChange() {
+  function handleApplyPlanChange() {
     if (!id) return;
-    setBusy(true);
-    try {
-      await applyPlanChange(id, { price_id: priceId, quantity, proration_behavior: prorationBehavior });
-      notify('Plan changed');
-      setPlanModalOpen(false);
-      setPreview(null);
-      reload();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Plan change failed', 'alert');
-    } finally {
-      setBusy(false);
-    }
+    void run(async () => {
+      try {
+        await applyPlanChange(id, { price_id: priceId, quantity, proration_behavior: prorationBehavior });
+        notify('Plan changed');
+        setPlanModalOpen(false);
+        setPreview(null);
+        reload();
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Plan change failed', 'alert');
+      }
+    });
   }
 
-  async function handleCancel(atPeriodEnd: boolean) {
+  function handleCancel(atPeriodEnd: boolean) {
     if (!id) return;
-    setBusy(true);
-    try {
-      await cancelSubscription(id, atPeriodEnd);
-      notify(atPeriodEnd ? 'Canceled at period end' : 'Canceled');
-      reload();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Cancel failed', 'alert');
-    } finally {
-      setBusy(false);
-      setConfirmCancel(null);
-    }
+    void run(async () => {
+      try {
+        await cancelSubscription(id, atPeriodEnd);
+        notify(atPeriodEnd ? 'Canceled at period end' : 'Canceled');
+        reload();
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Cancel failed', 'alert');
+      } finally {
+        setConfirmCancel(null);
+      }
+    });
   }
 
-  async function handleResume() {
+  function handleResume() {
     if (!id) return;
-    setBusy(true);
-    try {
-      await resumeSubscription(id);
-      notify('Resumed');
-      reload();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : 'Resume failed', 'alert');
-    } finally {
-      setBusy(false);
-    }
+    void run(async () => {
+      try {
+        await resumeSubscription(id);
+        notify('Resumed');
+        reload();
+      } catch (err) {
+        notify(err instanceof Error ? err.message : 'Resume failed', 'alert');
+      }
+    });
   }
 
   if (loading) return <LoadingState />;

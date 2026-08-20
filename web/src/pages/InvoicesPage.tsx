@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { listInvoices } from '../lib/api';
-import type { Invoice } from '../lib/types';
 import { Amount } from '../components/Amount';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { formatTimestamp } from '../lib/format';
+import { useAsyncData } from '../lib/hooks';
 
 const STATUS_OPTIONS = ['', 'draft', 'open', 'paid', 'uncollectible', 'void'];
 
@@ -12,18 +12,11 @@ export function InvoicesPage() {
   const [status, setStatus] = useState('');
   const [customerId, setCustomerId] = useState('');
   const [appliedCustomerId, setAppliedCustomerId] = useState('');
-  const [rows, setRows] = useState<Invoice[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    listInvoices({ status: status || undefined, customer_id: appliedCustomerId || undefined, limit: 100 })
-      .then((res) => setRows(res.invoices))
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [status, appliedCustomerId]);
+  const { data, loading, error } = useAsyncData(
+    () => listInvoices({ status: status || undefined, customer_id: appliedCustomerId || undefined, limit: 100 }),
+    [status, appliedCustomerId],
+  );
+  const rows = data?.invoices ?? [];
 
   return (
     <div className="flex flex-col gap-6">

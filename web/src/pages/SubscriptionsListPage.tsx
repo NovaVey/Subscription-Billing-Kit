@@ -6,6 +6,7 @@ import { Amount } from '../components/Amount';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { formatDateOnly } from '../lib/format';
+import { useAsyncData } from '../lib/hooks';
 
 const STATUS_OPTIONS = [
   '',
@@ -23,33 +24,38 @@ export function SubscriptionsListPage() {
   const [status, setStatus] = useState('');
   const [q, setQ] = useState('');
   const [appliedQ, setAppliedQ] = useState('');
+  const { data, loading, error } = useAsyncData(
+    () => listSubscriptions({ status: status || undefined, q: appliedQ || undefined, limit: 25 }),
+    [status, appliedQ],
+  );
   const [rows, setRows] = useState<SubscriptionListRow[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
 
+  // loadMore appends to `rows` rather than replacing it, which doesn't fit
+  // useAsyncData's replace-on-fetch shape - so the initial (filter-driven)
+  // load goes through the shared hook, and only the append step stays
+  // hand-rolled here. See the /improve audit.
   useEffect(() => {
-    setLoading(true);
-    setError(null);
-    listSubscriptions({ status: status || undefined, q: appliedQ || undefined, limit: 25 })
-      .then((res) => {
-        setRows(res.subscriptions);
-        setCursor(res.nextCursor);
-      })
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, [status, appliedQ]);
+    if (data) {
+      setRows(data.subscriptions);
+      setCursor(data.nextCursor);
+      setLoadMoreError(null);
+    }
+  }, [data]);
 
   function loadMore() {
     if (!cursor) return;
-    setLoading(true);
+    setLoadingMore(true);
+    setLoadMoreError(null);
     listSubscriptions({ status: status || undefined, q: appliedQ || undefined, cursor, limit: 25 })
       .then((res) => {
         setRows((prev) => [...prev, ...res.subscriptions]);
         setCursor(res.nextCursor);
       })
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
+      .catch((err: Error) => setLoadMoreError(err.message))
+      .finally(() => setLoadingMore(false));
   }
 
   return (
@@ -89,7 +95,7 @@ export function SubscriptionsListPage() {
         </div>
       </div>
 
-      {error && <ErrorState message={`Could not load subscriptions: ${error}`} />}
+      {(error ?? loadMoreError) && <ErrorState message={`Could not load subscriptions: ${error ?? loadMoreError}`} />}
       {loading && rows.length === 0 && <LoadingState />}
       {!loading && !error && rows.length === 0 && (
         <EmptyState message="No subscriptions match these filters. Try clearing the status or search." />
@@ -143,10 +149,10 @@ export function SubscriptionsListPage() {
         <button
           type="button"
           onClick={loadMore}
-          disabled={loading}
+          disabled={loadingMore}
           className="self-start border border-ink px-3 py-1.5 text-sm hover:bg-ink hover:text-paper disabled:opacity-50"
         >
-          {loading ? 'Loading…' : 'Load more'}
+          {loadingMore ? 'Loading…' : 'Load more'}
         </button>
       )}
     </div>

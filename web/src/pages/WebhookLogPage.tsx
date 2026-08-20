@@ -1,10 +1,11 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useState } from 'react';
 import { getWebhookEvent, listWebhookEvents, replayWebhookEvent } from '../lib/api';
 import type { WebhookEvent } from '../lib/types';
 import { StatusTag } from '../components/StatusTag';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { formatTimestamp } from '../lib/format';
 import { useToast } from '../components/Toast';
+import { useAsyncData } from '../lib/hooks';
 
 const STATUS_OPTIONS = ['', 'received', 'processing', 'processed', 'failed', 'skipped'];
 
@@ -21,24 +22,15 @@ export function WebhookLogPage() {
   const [status, setStatus] = useState('');
   const [type, setType] = useState('');
   const [appliedType, setAppliedType] = useState('');
-  const [rows, setRows] = useState<WebhookEvent[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, reload } = useAsyncData(
+    () => listWebhookEvents({ status: status || undefined, type: appliedType || undefined, limit: 100 }),
+    [status, appliedType],
+  );
+  const rows = data?.events ?? [];
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [payloads, setPayloads] = useState<Record<string, Record<string, unknown>>>({});
   const [loadingPayload, setLoadingPayload] = useState<string | null>(null);
   const [replaying, setReplaying] = useState<string | null>(null);
-
-  function reload() {
-    setLoading(true);
-    setError(null);
-    listWebhookEvents({ status: status || undefined, type: appliedType || undefined, limit: 100 })
-      .then((res) => setRows(res.events))
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
-  }
-
-  useEffect(reload, [status, appliedType]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
