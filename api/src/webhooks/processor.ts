@@ -122,26 +122,48 @@ async function processRow(row: WebhookEventRow): Promise<void> {
       'webhook event processing failed',
     );
     const guard = claimGuard(row);
-    if (attempts >= MAX_ATTEMPTS) {
-      const parked = await db
-        .update(webhookEvents)
-        .set({ status: 'failed', attempts, lastError: message })
-        .where(guard)
-        .returning({ stripeEventId: webhookEvents.stripeEventId });
-      logIfDiscarded(parked, row, 'failure (max attempts reached)');
-    } else {
-      const backoffSeconds = computeBackoffSeconds(attempts);
-      const requeued = await db
-        .update(webhookEvents)
-        .set({
-          status: 'received',
-          attempts,
-          lastError: message,
-          nextAttemptAt: new Date(Date.now() + backoffSeconds * 1000),
-        })
-        .where(guard)
-        .returning({ stripeEventId: webhookEvents.stripeEventId });
-      logIfDiscarded(requeued, row, 'retry backoff');
+    // This bookkeeping write itself can fail (a brief DB pool exhaustion,
+    // a transient connection error) - unguarded, that exception would
+    // propagate straight out of processRow, and processPendingWebhookEvents'
+    // batch loop (below) had no per-row isolation of its own, so it would
+    // abort the ENTIRE already-claimed batch. Every other row in that
+    // batch - already flipped to 'processing' with nothing actually wrong
+    // with it - would then sit invisible to every subsequent claimBatch()
+    // (which only selects status='received') until the reaper notices its
+    // stale lease a full WEBHOOK_LEASE_SECONDS later, turning one transient
+    // DB hiccup into a multi-minute stall for a whole batch of otherwise-
+    // healthy events. Catching it here means this row is simply left
+    // 'processing' for the reaper to recover, same as a genuine crash mid-
+    // processing already safely produces - not a new failure mode, just
+    // this one no longer taking the rest of the batch down with it. See
+    // the deep bug hunt.
+    try {
+      if (attempts >= MAX_ATTEMPTS) {
+        const parked = await db
+          .update(webhookEvents)
+          .set({ status: 'failed', attempts, lastError: message })
+          .where(guard)
+          .returning({ stripeEventId: webhookEvents.stripeEventId });
+        logIfDiscarded(parked, row, 'failure (max attempts reached)');
+      } else {
+        const backoffSeconds = computeBackoffSeconds(attempts);
+        const requeued = await db
+          .update(webhookEvents)
+          .set({
+            status: 'received',
+            attempts,
+            lastError: message,
+            nextAttemptAt: new Date(Date.now() + backoffSeconds * 1000),
+          })
+          .where(guard)
+          .returning({ stripeEventId: webhookEvents.stripeEventId });
+        logIfDiscarded(requeued, row, 'retry backoff');
+      }
+    } catch (bookkeepingErr) {
+      logger.error(
+        { err: bookkeepingErr, stripeEventId: row.stripeEventId, type: row.type },
+        "failed to record a webhook event's failure - leaving it claimed for the reaper to recover its lease",
+      );
     }
   }
 }
@@ -149,7 +171,19 @@ async function processRow(row: WebhookEventRow): Promise<void> {
 export async function processPendingWebhookEvents(batchSize = 10): Promise<{ claimed: number }> {
   const rows = await claimBatch(batchSize);
   for (const row of rows) {
-    await processRow(row);
+    try {
+      await processRow(row);
+    } catch (err) {
+      // processRow already contains its own dispatch-failure and
+      // bookkeeping-failure handling (above) - this is a last-resort
+      // backstop against a genuinely unanticipated bug in processRow
+      // itself, so that one row still can't abort the rest of an
+      // already-claimed batch. See the deep bug hunt.
+      logger.error(
+        { err, stripeEventId: row.stripeEventId, type: row.type },
+        'unexpected error processing a webhook event - leaving it claimed for the reaper to recover its lease',
+      );
+    }
   }
   return { claimed: rows.length };
 }

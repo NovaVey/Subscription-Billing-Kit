@@ -10,6 +10,11 @@ const mockSubscriptionsCancel = vi.fn();
 const mockSubscriptionsResume = vi.fn();
 const mockSubscriptionsRetrieve = vi.fn();
 const mockInvoicesRetrieve = vi.fn();
+// syncSubscriptionFromStripe (reached via resyncAfterMutation on every
+// plan-change/cancel/resume route below) now separately paginates
+// subscription items (finding #24, deep bug hunt) - nothing in this file
+// asserts on item content, so it defaults to empty via beforeEach below.
+const mockSubscriptionItemsList = vi.fn();
 
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
@@ -26,6 +31,7 @@ vi.mock('../../src/stripe/client.js', () => ({
       resume: (...args: unknown[]) => mockSubscriptionsResume(...args),
       retrieve: (...args: unknown[]) => mockSubscriptionsRetrieve(...args),
     },
+    subscriptionItems: { list: (...args: unknown[]) => mockSubscriptionItemsList(...args) },
   },
 }));
 
@@ -59,6 +65,8 @@ beforeEach(() => {
   mockSubscriptionsCancel.mockReset();
   mockSubscriptionsResume.mockReset();
   mockSubscriptionsRetrieve.mockReset();
+  mockSubscriptionItemsList.mockReset();
+  mockSubscriptionItemsList.mockReturnValue([]);
 });
 
 afterAll(async () => {

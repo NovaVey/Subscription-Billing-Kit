@@ -48,7 +48,29 @@ export const EnvSchema = z.object({
       return z.NEVER;
     }),
   WEBHOOK_LEASE_SECONDS: z.coerce.number().int().positive().default(300),
-  RECONCILE_TZ: z.string().default('UTC'),
+  // A non-empty-string check alone lets a typo ('America/Denver_') pass
+  // boot cleanly - nothing at boot time ever exercises this value, since
+  // it's only read by scripts/reconcile-nightly.ts's own process, not the
+  // running API server. The first (and every subsequent) time the nightly
+  // cron actually runs, computeYesterdayWindow()'s
+  // `new Intl.DateTimeFormat(..., { timeZone: RECONCILE_TZ })` throws
+  // RangeError: Invalid time zone specified, silently skipping that
+  // night's entire reconciliation run with nothing surfacing it until
+  // someone notices the failing cron. Validated against the same
+  // Intl.DateTimeFormat constructor the nightly job actually uses, so an
+  // invalid IANA identifier fails loudly at boot instead. See the deep bug
+  // hunt.
+  RECONCILE_TZ: z.string().default('UTC').refine(
+    (v) => {
+      try {
+        new Intl.DateTimeFormat(undefined, { timeZone: v });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: 'RECONCILE_TZ is not a valid IANA time zone identifier' },
+  ),
   // Shared-secret admin access control (Phase 10) - gates every admin route
   // (subscriptions, invoices, dunning, reconciliation, webhook-events admin
   // endpoints) but never the public customer/checkout/portal routes or the

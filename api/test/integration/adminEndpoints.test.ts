@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { afterAll, describe, expect, it } from 'vitest';
 
 const { buildApp } = await import('../../src/app.js');
@@ -171,6 +171,68 @@ describe('GET /subscriptions', () => {
   it('rejects an invalid limit', async () => {
     const response = await app.inject({ method: 'GET', url: '/subscriptions?limit=0', headers: WRITE_KEY_HEADERS });
     expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects a malformed :id with a clean 400 instead of a raw Postgres error text leak (finding #17, deep bug hunt)', async () => {
+    const response = await app.inject({ method: 'GET', url: '/subscriptions/not-a-uuid', headers: WRITE_KEY_HEADERS });
+    expect(response.statusCode).toBe(400);
+    // Before this fix, a malformed id made Postgres throw `invalid input
+    // syntax for type uuid: "not-a-uuid"` and Fastify's fallback error
+    // handler serialized that raw driver text verbatim into a 500 - the
+    // response body must never contain it.
+    expect(JSON.stringify(response.json())).not.toMatch(/invalid input syntax|postgres|drizzle/i);
+  });
+
+  it('rejects a malformed cursor with 400 instead of a raw DB error', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/subscriptions?cursor=not-a-valid-cursor',
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('does not drop a subscription that ties on created_at with the page boundary (finding #25, deep bug hunt)', async () => {
+    const { id: customerId } = await seedCustomer({ email: 'tied-created-at@example.com' });
+    const { id: firstId } = await seedSubscription(customerId);
+    const { id: secondId } = await seedSubscription(customerId);
+    // Force both rows to share the exact same created_at - the tie the
+    // (created_at, id) tiebreaker exists to break. seedSubscription's own
+    // insert can't express this (it lets the DB default created_at to
+    // "now"), so it's forced directly here, same for both rows.
+    const tiedAt = new Date('2026-06-01T00:00:00.000Z');
+    await db.update(subscriptions).set({ createdAt: tiedAt }).where(inArray(subscriptions.id, [firstId, secondId]));
+
+    // Scoped to just these two rows via q= (both share this customer's
+    // email) - isolates the tie from every other subscription this file's
+    // other tests have seeded, without needing to know or walk through how
+    // many pages precede it.
+    const firstPage = await app.inject({
+      method: 'GET',
+      url: '/subscriptions?limit=1&q=tied-created-at@example.com',
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(firstPage.statusCode).toBe(200);
+    const firstBody = firstPage.json();
+    expect(firstBody.subscriptions).toHaveLength(1);
+    expect(firstBody.nextCursor).not.toBeNull();
+
+    const secondPage = await app.inject({
+      method: 'GET',
+      url: `/subscriptions?limit=1&q=tied-created-at@example.com&cursor=${encodeURIComponent(firstBody.nextCursor)}`,
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(secondPage.statusCode).toBe(200);
+    const secondBody = secondPage.json();
+    expect(secondBody.subscriptions).toHaveLength(1);
+
+    // Without the tiebreaker, the second page's `< cursor` predicate on
+    // created_at alone would strictly exclude the tied row forever - it
+    // would never appear, on this page or any other.
+    const seenIds = new Set([firstBody.subscriptions[0].id, secondBody.subscriptions[0].id]);
+    expect(seenIds).toEqual(new Set([firstId, secondId]));
+    // The third page must be empty - both tied rows were seen, nothing left.
+    expect(secondBody.nextCursor).toBeNull();
   });
 
   it('computes mrrMinor by normalizing each item to a monthly-equivalent amount before summing, not by summing raw amounts', async () => {

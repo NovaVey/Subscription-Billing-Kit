@@ -28,7 +28,7 @@
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { stripe } from '../api/src/stripe/client.js';
 import { pool, db } from '../api/src/db/client.js';
 import {
@@ -54,6 +54,16 @@ function nextEventId(): string {
   eventCounter += 1;
   return `evt_demo_${eventCounter}_${Date.now()}`;
 }
+
+// Every synthetic id deliverEvent() inserts into webhook_events - tracked
+// so teardown can delete exactly these rows (see the finally block below).
+// Without this, every run leaks 6-7 permanent fake rows into
+// webhook_events with no real Stripe signature or full payload, directly
+// contradicting this file's own stated intent not to leave demo debris
+// behind - they'd show up indefinitely in GET /admin/webhook-events and
+// the admin UI's webhook log, mixed in with genuine production events.
+// See the deep bug hunt.
+const deliveredEventIds: string[] = [];
 
 // subscription_events.stripe_event_id carries a real foreign key to
 // webhook_events.stripe_event_id (§4) - a real receiver always inserts the
@@ -90,6 +100,7 @@ async function deliverEvent<T>(
     payload: event,
     status: 'received',
   });
+  deliveredEventIds.push(id);
   return handler(event as never);
 }
 
@@ -266,6 +277,12 @@ async function main() {
     }
     if (localCustomerId) {
       await db.delete(customers).where(eq(customers.id, localCustomerId));
+    }
+    // webhook_events has no FK dependents left by this point (subscription_events,
+    // the only table that FKs to it, was already deleted above) - matching
+    // the cleanup already done for every other table this script touches.
+    if (deliveredEventIds.length > 0) {
+      await db.delete(webhookEvents).where(inArray(webhookEvents.stripeEventId, deliveredEventIds));
     }
     console.log('[demo] local rows cleaned up');
   }

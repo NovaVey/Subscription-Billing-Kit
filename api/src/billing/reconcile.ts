@@ -1,4 +1,4 @@
-import { and, eq, gte, isNotNull, lt } from 'drizzle-orm';
+import { and, eq, gte, lt } from 'drizzle-orm';
 import { stripe } from '../stripe/client.js';
 import { db } from '../db/client.js';
 import { invoices, reconciliationRuns, type ReconciliationReportEntry } from '../db/schema.js';
@@ -167,6 +167,11 @@ export interface RunReconciliationInput {
   periodStart: Date;
   periodEnd: Date;
   currency: string;
+  // Defaults to the real wall clock - overridable so the live-window
+  // clamp below (LIVE_WINDOW_BUFFER_MS) is deterministically testable,
+  // the same "now as an explicit, testable param" pattern
+  // computeYesterdayWindow above already establishes in this file.
+  now?: Date;
 }
 
 export interface RunReconciliationResult extends ClassifiedReconciliation {
@@ -175,16 +180,41 @@ export interface RunReconciliationResult extends ClassifiedReconciliation {
   invoiceCountLocal: number;
 }
 
+// Stripe's List Invoices has no ascending-order option (verified against
+// the installed SDK's own types, not assumed - §0 rule 9) - pages come
+// back newest-first, walked forward via starting_after. An invoice that
+// finalizes *during* this call - after an earlier page has already been
+// fetched, but before pagination completes - is newer than everything
+// already returned; every subsequent page only returns OLDER items, so it
+// can never surface, however many pages this walks. Unreachable for the
+// nightly cron (period_end is always a past midnight, already fully
+// settled by the time the cron runs) but real for an ad-hoc admin run
+// whose period_end is "now" - the common "reconcile since midnight" query,
+// run while checkouts are actively completing. Clamping the window's
+// effective upper bound a short buffer behind wall-clock now guarantees
+// nothing this call actually pages through is still mid-finalization, at
+// the cost of the last couple of minutes not being covered by *this* run
+// (the next one covers them - the stored/reported window reflects the
+// clamped bound actually used, not the raw requested one, so the run's own
+// record stays honest about what it covered). See the deep bug hunt.
+const LIVE_WINDOW_BUFFER_MS = 2 * 60 * 1000;
+
 // Stripe's List Invoices has no currency filter (verified against the
 // pinned version's actual API reference, not assumed - §0 rule 9), so
 // every invoice in the created-date window is fetched and filtered to the
-// requested currency client-side. Bounded locally by `finalized_at`
-// (§4's schema has no dedicated invoice "created" column) rather than
-// inventing one - a subscription invoice finalizes within about an hour
-// of creation under charge_automatically, close enough for a window
-// meant to span a full day or more.
+// requested currency client-side. Both sides window by the SAME field -
+// Stripe's own invoice.created, mirrored locally on invoices.created_at
+// (finding #18, deep bug hunt) - finalized_at can't serve this: it's
+// permanently null for a draft that never finalizes (permanently
+// excluding it from every possible window, misclassifying it missing_local
+// forever) and can land in a different day's window than created for a
+// normally-finalizing invoice (Stripe's ~1hr charge_automatically
+// auto-finalize delay).
 export async function runReconciliation(input: RunReconciliationInput): Promise<RunReconciliationResult> {
   const currency = input.currency.toLowerCase();
+  const now = input.now ?? new Date();
+  const settledBound = new Date(now.getTime() - LIVE_WINDOW_BUFFER_MS);
+  const periodEnd = input.periodEnd.getTime() > settledBound.getTime() ? settledBound : input.periodEnd;
 
   // Half-open on both sides ([periodStart, periodEnd)), matching the local
   // query below exactly - an invoice landing on a shared boundary between
@@ -193,19 +223,25 @@ export async function runReconciliation(input: RunReconciliationInput): Promise<
   // while single-counted locally (or vice versa). This was previously `lte`
   // on periodEnd, which broke that invariant at the boundary - see the
   // /improve audit.
-  const stripeInvoices: ReconciliationInvoiceSnapshot[] = [];
+  //
+  // Keyed by id, not appended to an array - a duplicate Stripe returns
+  // across two pages (the pagination race documented above can shift an
+  // object's page position, not just drop it) can never be double-counted
+  // in invoiceCountStripe/stripeTotalMinor. See the deep bug hunt.
+  const stripeInvoicesById = new Map<string, ReconciliationInvoiceSnapshot>();
   for await (const invoice of stripe.invoices.list({
-    created: { gte: toStripeSeconds(input.periodStart), lt: toStripeSeconds(input.periodEnd) },
+    created: { gte: toStripeSeconds(input.periodStart), lt: toStripeSeconds(periodEnd) },
     limit: 100,
   })) {
     if (invoice.currency.toLowerCase() !== currency) continue;
-    stripeInvoices.push({
+    stripeInvoicesById.set(invoice.id!, {
       stripeInvoiceId: invoice.id!,
       status: invoice.status ?? 'draft',
       amountDueMinor: invoice.amount_due,
       amountPaidMinor: invoice.amount_paid,
     });
   }
+  const stripeInvoices = [...stripeInvoicesById.values()];
 
   const localRows = await db
     .select()
@@ -213,9 +249,8 @@ export async function runReconciliation(input: RunReconciliationInput): Promise<
     .where(
       and(
         eq(invoices.currency, currency),
-        isNotNull(invoices.finalizedAt),
-        gte(invoices.finalizedAt, input.periodStart),
-        lt(invoices.finalizedAt, input.periodEnd),
+        gte(invoices.createdAt, input.periodStart),
+        lt(invoices.createdAt, periodEnd),
       ),
     );
   const localInvoices: ReconciliationInvoiceSnapshot[] = localRows.map((row) => ({
@@ -231,7 +266,7 @@ export async function runReconciliation(input: RunReconciliationInput): Promise<
     .insert(reconciliationRuns)
     .values({
       periodStart: input.periodStart,
-      periodEnd: input.periodEnd,
+      periodEnd,
       currency,
       stripeTotalMinor: classified.stripeTotalMinor,
       localTotalMinor: classified.localTotalMinor,

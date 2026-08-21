@@ -1,9 +1,25 @@
-import { and, eq, isNull, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 import type Stripe from 'stripe';
+import { stripe } from './client.js';
 import { db, type Executor } from '../db/client.js';
-import { customers, subscriptionItems, subscriptions } from '../db/schema.js';
+import { customers, invoices, subscriptionItems, subscriptions } from '../db/schema.js';
+import { logger } from '../lib/logger.js';
 import { fromStripeSeconds, fromStripeSecondsOrNull } from '../lib/time.js';
 import { recordTransition, type SubscriptionStatus } from '../billing/stateMachine.js';
+import { openDunningCycleOnPaymentFailed, resolveDunningOnInvoicePaid } from '../billing/dunning.js';
+
+// unit_amount_minor is NOT NULL, so tiered/graduated/package pricing
+// (billing_scheme other than 'per_unit', which only sets `tiers`, not
+// `unit_amount`) can't just store null - but silently storing 0 (the
+// previous behavior) is worse: it looks like a real, free-tier price
+// rather than "this item's amount genuinely isn't representable as one
+// flat number", and every downstream reader (MRR, revenue reporting) that
+// doesn't know to check for it silently undercounts with no signal
+// anywhere that data was lost. -1 can never be a real minor amount, so
+// it's unambiguous as a sentinel; every reader of unit_amount_minor that
+// cares about correctness (currently just computeMrrMinor) must check for
+// it explicitly rather than summing it in. See the deep bug hunt.
+export const TIERED_PRICING_SENTINEL_MINOR = -1;
 
 // Shared projection logic used by both the webhook handlers (Phase 3) and
 // the admin/checkout routes (Phase 4) - a plan change made through the API
@@ -14,6 +30,31 @@ import { recordTransition, type SubscriptionStatus } from '../billing/stateMachi
 
 export function resolveStripeId(ref: string | { id: string }): string {
   return typeof ref === 'string' ? ref : ref.id;
+}
+
+// A Subscription's own `items` field (as returned by subscriptions.retrieve
+// or delivered on a webhook payload) is capped at Stripe's default list
+// page size (10), with no `limit` param on SubscriptionRetrieveParams to
+// ask for more (verified against the installed SDK's own types, not
+// assumed - §0 rule 9) - a subscription with 11+ items would otherwise
+// silently look 10-items-large to every reader of `subscription.items.data`.
+// subscriptionItems.list is a real, separately-paginated endpoint; auto-
+// paginating it here (the SDK's `for await` iterates every page
+// transparently) gets the complete, current item list regardless of count.
+// `expand: ['data.price']` matches what retrieve's own `expand:
+// ['items.data.price']` already gave every existing caller - projectSubscription
+// reads price.currency/unit_amount/recurring/metadata directly off each
+// item. See the deep bug hunt.
+async function listAllSubscriptionItems(stripeSubscriptionId: string): Promise<Stripe.SubscriptionItem[]> {
+  const items: Stripe.SubscriptionItem[] = [];
+  for await (const item of stripe.subscriptionItems.list({
+    subscription: stripeSubscriptionId,
+    limit: 100,
+    expand: ['data.price'],
+  })) {
+    items.push(item);
+  }
+  return items;
 }
 
 export async function syncCustomerFromStripe(customer: Stripe.Customer): Promise<{ id: string }> {
@@ -50,14 +91,22 @@ export async function syncCustomerFromStripe(customer: Stripe.Customer): Promise
 // Periods live on the items (§5.1) - subscriptions.next_period_end_derived
 // is computed here as the minimum item period end and is never read back
 // off the Stripe object directly.
+//
+// `items` is the caller's own fully-paginated list (see
+// listAllSubscriptionItems below), not `subscription.items.data` - a
+// Subscription's own retrieve() response caps that nested list at
+// Stripe's default page size (10) with no way to request more, so a
+// subscription with 11+ items would otherwise silently look like it only
+// has the first 10 to every reader here, including the removal-detection
+// step below. See the deep bug hunt.
 async function projectSubscription(
   tx: Executor,
   subscription: Stripe.Subscription,
+  items: readonly Stripe.SubscriptionItem[],
   localCustomerId: string,
   existingId: string | undefined,
   lastEventAt: Date,
 ): Promise<string> {
-  const items = subscription.items.data;
   const firstPrice = items[0]?.price;
   const planCode = (firstPrice?.metadata['plan_code'] as string | undefined) ?? firstPrice?.id ?? 'unknown';
   const currency = firstPrice?.currency ?? subscription.currency;
@@ -99,6 +148,14 @@ async function projectSubscription(
   // clause refers to each conflicting row's own incoming values (standard
   // Postgres upsert), not a single shared literal. See the /improve audit.
   if (items.length > 0) {
+    for (const item of items) {
+      if (item.price.unit_amount === null) {
+        logger.warn(
+          { subscriptionId: localId, stripeItemId: item.id, priceId: item.price.id, billingScheme: item.price.billing_scheme },
+          'subscription item has no flat unit_amount (tiered/graduated/package pricing) - storing the sentinel, MRR for this item is excluded rather than reported as 0',
+        );
+      }
+    }
     await tx
       .insert(subscriptionItems)
       .values(
@@ -107,7 +164,7 @@ async function projectSubscription(
           stripeItemId: item.id,
           priceId: item.price.id,
           quantity: item.quantity ?? 1,
-          unitAmountMinor: item.price.unit_amount ?? 0,
+          unitAmountMinor: item.price.unit_amount ?? TIERED_PRICING_SENTINEL_MINOR,
           currency: item.price.currency,
           recurringInterval: item.price.recurring?.interval ?? null,
           currentPeriodStart: fromStripeSeconds(item.current_period_start),
@@ -168,6 +225,69 @@ export interface SyncSubscriptionResult {
   toStatus: SubscriptionStatus;
 }
 
+// An invoice.* event claimed before its subscription's own
+// customer.subscription.created has been processed (processor.ts orders
+// by receivedAt, not Stripe's event.created) previously stored
+// subscriptionId=null with nothing ever re-linking it once the
+// subscription's local row eventually appeared - permanently losing the
+// link, and for a payment_failed invoice, the dunning trigger it should
+// have opened. Called the moment a subscription's local row is first
+// created (never on a routine update - only a first-time insert can have
+// orphans waiting on it), this finds every local invoice referencing this
+// Stripe subscription id with no local link yet, links them, and replays
+// each one through the same dunning gate handleInvoiceEvent's own
+// event-type dispatch would have applied, in chronological order (a paid
+// invoice must resolve a cycle an earlier orphaned failed invoice in this
+// same batch just opened, not the other way around). There's no original
+// event *type* left to dispatch on this long after the fact, so the
+// invoice's own current, already-authoritative fields stand in for it:
+// status 'open' with attempt_count > 0 is Stripe's own signal that at
+// least one charge attempt has failed (a freshly finalized 'open' invoice
+// with no attempts yet is not a failure and must not open a cycle);
+// status 'paid' mirrors invoice.paid. Any other status (draft, void,
+// uncollectible) never touched dunning even in the real handler, so it's
+// skipped here too. See the deep bug hunt.
+async function relinkOrphanedInvoices(
+  tx: Executor,
+  stripeSubscriptionId: string,
+  localSubscriptionId: string,
+): Promise<void> {
+  const orphaned = await tx
+    .select()
+    .from(invoices)
+    .where(and(eq(invoices.stripeSubscriptionId, stripeSubscriptionId), isNull(invoices.subscriptionId)))
+    .orderBy(asc(invoices.lastEventAt));
+  if (orphaned.length === 0) return;
+
+  await tx
+    .update(invoices)
+    .set({ subscriptionId: localSubscriptionId })
+    .where(
+      inArray(
+        invoices.id,
+        orphaned.map((row) => row.id),
+      ),
+    );
+
+  for (const invoiceRow of orphaned) {
+    const now = invoiceRow.lastEventAt ?? new Date();
+    if (invoiceRow.status === 'open' && invoiceRow.attemptCount > 0) {
+      await openDunningCycleOnPaymentFailed(tx, {
+        subscriptionId: localSubscriptionId,
+        invoiceId: invoiceRow.id,
+        now,
+      });
+    } else if (invoiceRow.status === 'paid') {
+      await resolveDunningOnInvoicePaid(tx, { invoiceId: invoiceRow.id, now });
+    }
+  }
+
+  logger.info(
+    { stripeSubscriptionId, localSubscriptionId, relinkedCount: orphaned.length },
+    're-linked invoices that arrived before their subscription row existed, and replayed them through the dunning gate',
+  );
+}
+
 export async function syncSubscriptionFromStripe(
   subscription: Stripe.Subscription,
   options: SyncSubscriptionOptions,
@@ -182,6 +302,11 @@ export async function syncSubscriptionFromStripe(
       `no local customer for Stripe customer ${stripeCustomerId} — customer.* events must be processed first`,
     );
   }
+
+  // Fetched outside the transaction, same as the customer lookup above -
+  // this is a Stripe API call, not a DB read, and there's no reason to
+  // hold row locks open across the network round trip(s) it takes.
+  const items = await listAllSubscriptionItems(subscription.id);
 
   return db.transaction(async (tx) => {
     // Re-read (and lock) the row inside this transaction, not from a
@@ -213,10 +338,20 @@ export async function syncSubscriptionFromStripe(
     const id = await projectSubscription(
       tx,
       subscription,
+      items,
       customerRow.id,
       existing?.id,
       options.lastEventAt,
     );
+
+    // Only on a first-time insert (existing was undefined) - only then can
+    // there possibly be an invoice waiting on this subscription id that
+    // arrived before this row did. A routine update has nothing to
+    // re-link (every invoice this subscription will ever reference from
+    // here on has this row available to link against immediately).
+    if (!existing) {
+      await relinkOrphanedInvoices(tx, subscription.id, id);
+    }
 
     if (fromStatus !== toStatus || options.forceRecord) {
       await recordTransition(tx, {

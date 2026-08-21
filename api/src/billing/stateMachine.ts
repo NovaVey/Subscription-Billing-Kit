@@ -48,7 +48,17 @@ export function isExpectedTransition(
 ): boolean {
   if (from === null) return true; // first time we've seen this subscription
   if (from === to) return true; // re-sync with no status change, not a transition
-  return EXPECTED_TRANSITIONS[from].has(to);
+  // `from` is sourced verbatim from subscriptions.status, itself written
+  // unvalidated from Stripe's own status field (§5.6) - if Stripe ever
+  // ships a status value outside this file's 8-entry union,
+  // EXPECTED_TRANSITIONS[from] is undefined and `.has(to)` would throw,
+  // crashing inside recordTransition's transaction and permanently parking
+  // every subsequent webhook for that subscription as 'failed'. Falling
+  // back to an empty set instead treats an unrecognized status the same
+  // way this file already treats any other unexpected transition -
+  // applied and logged, never blocking - matching the module's own stated
+  // "Stripe is always the source of truth" design. See the deep bug hunt.
+  return (EXPECTED_TRANSITIONS[from] ?? new Set<SubscriptionStatus>()).has(to);
 }
 
 export interface TransitionInput {

@@ -15,19 +15,44 @@ import {
   type RunReconciliationResult,
 } from '../api/src/billing/reconcile.js';
 
+// One outcome per currency attempted - `result` is set on success, `error`
+// on failure, so a caller can tell which currencies actually reconciled
+// without either throwing away the successes or masking the failures.
+export interface ReconcileCurrencyOutcome {
+  currency: string;
+  result: RunReconciliationResult | null;
+  error: string | null;
+}
+
 // Runs one reconciliation per distinct currency - totals are never summed
 // across currencies (§5.9/§5.10). Exported (rather than inlined in main())
 // so the per-currency looping itself - not just runReconciliation, which is
 // already unit/integration tested - has direct test coverage. See the
 // /improve audit.
+//
+// Each currency's reconciliation is isolated in its own try/catch - a
+// transient failure for one currency (a Stripe 500 mid-pagination, a DB
+// hiccup) must not abort every currency after it in the loop with no
+// partial persistence. Before this, a single failed currency meant every
+// subsequent currency that night went silently unreconciled, since
+// tomorrow's cron reconciles tomorrow's window, not the missed day. See
+// the deep bug hunt.
 export async function reconcileEachCurrency(
   window: { periodStart: Date; periodEnd: Date },
   currencies: readonly string[],
-): Promise<{ currency: string; result: RunReconciliationResult }[]> {
-  const results: { currency: string; result: RunReconciliationResult }[] = [];
+): Promise<ReconcileCurrencyOutcome[]> {
+  const results: ReconcileCurrencyOutcome[] = [];
   for (const currency of currencies) {
-    const result = await runReconciliation({ ...window, currency });
-    results.push({ currency, result });
+    try {
+      const result = await runReconciliation({ ...window, currency });
+      results.push({ currency, result, error: null });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[reconcile-nightly] ${currency}: reconciliation failed, continuing with the remaining currencies: ${message}`,
+      );
+      results.push({ currency, result: null, error: message });
+    }
   }
   return results;
 }
@@ -63,12 +88,26 @@ async function main() {
   }
 
   const results = await reconcileEachCurrency({ periodStart: start, periodEnd: end }, currencies);
-  for (const { currency, result } of results) {
+  const failed: string[] = [];
+  for (const { currency, result, error } of results) {
+    if (error) {
+      failed.push(currency);
+      continue;
+    }
     console.log(
-      `[reconcile-nightly] ${currency}: ${result.mismatchCount} mismatch(es), ` +
-        `stripe=${result.stripeTotalMinor} local=${result.localTotalMinor} ` +
-        `(run ${result.runId})`,
+      `[reconcile-nightly] ${currency}: ${result!.mismatchCount} mismatch(es), ` +
+        `stripe=${result!.stripeTotalMinor} local=${result!.localTotalMinor} ` +
+        `(run ${result!.runId})`,
     );
+  }
+
+  // A per-currency failure isn't a script crash (the fix above), but the
+  // run as a whole still failed to fully reconcile - exitCode surfaces
+  // that to the cron/CI runner rather than reporting clean success for a
+  // partially-skipped night. See the deep bug hunt.
+  if (failed.length > 0) {
+    console.error(`[reconcile-nightly] ${failed.length} currenc${failed.length === 1 ? 'y' : 'ies'} failed: ${failed.join(', ')}`);
+    process.exitCode = 1;
   }
 }
 

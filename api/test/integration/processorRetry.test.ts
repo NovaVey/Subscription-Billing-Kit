@@ -2,9 +2,14 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockRetrieve = vi.fn();
+// syncSubscriptionFromStripe now separately paginates subscription items
+// (finding #24, deep bug hunt) - nothing in this file asserts on item
+// content, so it defaults to empty via beforeEach below.
+const mockSubscriptionItemsList = vi.fn();
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
     subscriptions: { retrieve: (...args: unknown[]) => mockRetrieve(...args) },
+    subscriptionItems: { list: (...args: unknown[]) => mockSubscriptionItemsList(...args) },
   },
 }));
 
@@ -17,6 +22,8 @@ const cleanupEventIds: string[] = [];
 
 beforeEach(() => {
   mockRetrieve.mockReset();
+  mockSubscriptionItemsList.mockReset();
+  mockSubscriptionItemsList.mockReturnValue([]);
 });
 
 afterAll(async () => {

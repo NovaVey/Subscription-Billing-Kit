@@ -140,10 +140,37 @@ export const invoices = pgTable(
       .notNull()
       .references(() => customers.id),
     subscriptionId: uuid('subscription_id').references(() => subscriptions.id), // null for one-off invoices
+    // The raw Stripe subscription id an invoice references, stored even
+    // when subscription_id (above) is still null - an invoice.* event
+    // claimed before its subscription's own customer.subscription.created
+    // has been processed (processor.ts orders by receivedAt, not Stripe's
+    // event.created) previously had no way to ever find its subscription
+    // again once the local row eventually appeared, permanently losing the
+    // link and, for a payment_failed invoice, the dunning trigger it
+    // should have opened. syncSubscriptionFromStripe re-links every
+    // orphaned row matching this column when it creates a subscription's
+    // local row for the first time - see relinkOrphanedInvoices in sync.ts.
+    // Null for a one-off invoice, same as subscription_id. See the deep
+    // bug hunt.
+    stripeSubscriptionId: text('stripe_subscription_id'),
     stripeInvoiceId: text('stripe_invoice_id').unique().notNull(),
     number: text('number'),
     status: text('status').notNull(), // draft|open|paid|uncollectible|void
     currency: text('currency').notNull(),
+    // Stripe's own invoice.created, not this row's own insert time -
+    // reconciliation windows local invoices by this same field Stripe's
+    // own list query windows by (finding #18, deep bug hunt), which
+    // finalized_at (below) can't do: it's permanently null for a draft
+    // that never finalizes, and can land in a different day's window than
+    // created for a normally-finalizing invoice (Stripe's ~1hr
+    // charge_automatically auto-finalize delay). Nullable, not backfilled
+    // for rows that predate this column - every invoice.ts upsert
+    // (including a plain re-sync with no real change) sets it, so an
+    // existing row gets it filled in on its own next Stripe event; only a
+    // dormant pre-migration invoice that never receives another event
+    // stays excluded from reconciliation's local-side window in the
+    // meantime. See the deep bug hunt.
+    createdAt: timestamp('created_at', { withTimezone: true }),
     amountDueMinor: integer('amount_due_minor').notNull(),
     amountPaidMinor: integer('amount_paid_minor').notNull().default(0),
     attemptCount: integer('attempt_count').notNull().default(0),
@@ -163,6 +190,14 @@ export const invoices = pgTable(
     // See the /improve audit.
     index('invoices_customer_id_idx').on(t.customerId),
     index('invoices_period_start_idx').on(t.periodStart),
+    // Reconciliation's local-side query now windows by created_at
+    // (finding #18, deep bug hunt) - same reasoning as the period_start
+    // index above.
+    index('invoices_created_at_idx').on(t.createdAt),
+    // relinkOrphanedInvoices' own lookup (finding #21, deep bug hunt) -
+    // every orphaned row for a given Stripe subscription id, found the
+    // moment that subscription's local row is first created.
+    index('invoices_stripe_subscription_id_idx').on(t.stripeSubscriptionId),
   ],
 );
 

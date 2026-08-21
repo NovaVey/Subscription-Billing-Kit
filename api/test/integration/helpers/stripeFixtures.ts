@@ -76,6 +76,10 @@ export function fakeInvoice(overrides: Record<string, unknown> = {}) {
     number: 'INV-0001',
     status: 'open',
     currency: 'usd',
+    // invoices.created_at (finding #18, deep bug hunt) reads this field -
+    // every fixture gets a default so a test that doesn't care about the
+    // exact instant doesn't need to set it itself.
+    created: nowSeconds,
     amount_due: 2900,
     amount_paid: 0,
     attempt_count: 0,

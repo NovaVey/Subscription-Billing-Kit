@@ -7,6 +7,11 @@ export interface SubscriptionListRow {
   planCode: string;
   currency: string;
   mrrMinor: number;
+  // True when at least one item uses tiered/graduated/package pricing
+  // (no single flat unit_amount) - mrrMinor excludes that item rather than
+  // reading it as 0, so this figure is an undercount whenever this is
+  // true, not the whole story. See the deep bug hunt.
+  hasTieredPricing: boolean;
   nextPeriodEndDerived: string | null;
   dunningStage: number;
   customerEmail: string;

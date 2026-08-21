@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createCheckoutSession } from '../stripe/checkout.js';
 import { clientIdempotencyToken } from '../stripe/idempotency.js';
 import { loadCustomerOr404 } from '../lib/lookups.js';
+import { perCustomerRateLimit } from '../lib/rateLimit.js';
 import { parseOrReply } from '../lib/validate.js';
 
 const CreateCheckoutSessionBody = z.object({
@@ -12,7 +13,7 @@ const CreateCheckoutSessionBody = z.object({
 });
 
 export async function checkoutRoutes(app: FastifyInstance) {
-  app.post('/checkout/sessions', async (req, reply) => {
+  app.post('/checkout/sessions', { config: { rateLimit: perCustomerRateLimit(10) } }, async (req, reply) => {
     const body = parseOrReply(CreateCheckoutSessionBody, req.body, reply);
     if (!body) return;
     const { customer_id, price_id, quantity } = body;

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { createPortalSession } from '../stripe/portal.js';
 import { clientIdempotencyToken } from '../stripe/idempotency.js';
 import { loadCustomerOr404 } from '../lib/lookups.js';
+import { perCustomerRateLimit } from '../lib/rateLimit.js';
 import { parseOrReply } from '../lib/validate.js';
 
 const CreatePortalSessionBody = z.object({
@@ -11,7 +12,7 @@ const CreatePortalSessionBody = z.object({
 });
 
 export async function portalRoutes(app: FastifyInstance) {
-  app.post('/portal/sessions', async (req, reply) => {
+  app.post('/portal/sessions', { config: { rateLimit: perCustomerRateLimit(10) } }, async (req, reply) => {
     const body = parseOrReply(CreatePortalSessionBody, req.body, reply);
     if (!body) return;
     const { customer_id, return_url } = body;

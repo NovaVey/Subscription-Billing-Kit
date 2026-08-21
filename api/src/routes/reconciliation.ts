@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { reconciliationRuns } from '../db/schema.js';
 import { runReconciliation } from '../billing/reconcile.js';
-import { parseOrReply } from '../lib/validate.js';
+import { parseOrReply, parseUuidParam } from '../lib/validate.js';
 
 const RunBody = z.object({
   period_start: z.iso.datetime(),
@@ -41,7 +41,8 @@ export async function reconciliationRoutes(app: FastifyInstance) {
   // Full row, including `report` - fetched on demand when the admin UI
   // drills into a single run, rather than on every list load.
   app.get('/admin/reconciliation/:id', async (req, reply) => {
-    const { id } = req.params as { id: string };
+    const id = parseUuidParam(req, reply);
+    if (!id) return;
     const [row] = await db.select().from(reconciliationRuns).where(eq(reconciliationRuns.id, id));
     if (!row) {
       return reply.code(404).send({ error: 'reconciliation run not found' });
