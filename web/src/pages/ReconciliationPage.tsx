@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { getReconciliationRun, listReconciliationRuns, runReconciliation } from '../lib/api';
 import type { ReconciliationReportEntry, ReconciliationRun, ReconciliationRunDetail } from '../lib/types';
 import { Amount } from '../components/Amount';
@@ -23,6 +23,13 @@ export function ReconciliationPage() {
   const runs = data?.runs ?? [];
   const [selected, setSelected] = useState<ReconciliationRunDetail | null>(null);
   const [drillingIn, setDrillingIn] = useState<string | null>(null);
+  // The id of the most recently clicked "Drill in" - not the same as
+  // `selected?.id`, which only updates once a response actually lands.
+  // Clicking a second run before the first one's request resolves must not
+  // let the first (now stale) response overwrite `selected` once it
+  // arrives, however the two responses happen to order themselves. See
+  // handleDrillIn below.
+  const latestDrillRequestRef = useRef<string | null>(null);
 
   const [periodStart, setPeriodStart] = useState('');
   const [periodEnd, setPeriodEnd] = useState('');
@@ -32,14 +39,21 @@ export function ReconciliationPage() {
   // The list response no longer carries `report` - fetch the full row on
   // demand only when an operator actually drills into it.
   async function handleDrillIn(run: ReconciliationRun) {
+    latestDrillRequestRef.current = run.id;
     setDrillingIn(run.id);
     try {
       const detail = await getReconciliationRun(run.id);
+      // A newer drill-in fired after this one - discard this stale
+      // response rather than clobbering the newer run's detail (or
+      // clearing a `drillingIn` state a newer request still owns). See the
+      // deep bug hunt.
+      if (latestDrillRequestRef.current !== run.id) return;
       setSelected(detail);
     } catch (err) {
+      if (latestDrillRequestRef.current !== run.id) return;
       notify(err instanceof Error ? err.message : 'Could not load run detail', 'alert');
     } finally {
-      setDrillingIn(null);
+      if (latestDrillRequestRef.current === run.id) setDrillingIn(null);
     }
   }
 

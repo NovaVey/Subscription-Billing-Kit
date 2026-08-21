@@ -142,6 +142,27 @@ export function computeYesterdayWindow(tz: string, now: Date): { start: Date; en
   return { start: startOfYesterdayUtc, end: startOfTodayUtc };
 }
 
+// Lists every currency Stripe actually invoiced in the window, so the
+// nightly job's per-currency loop can include a currency that has zero
+// local rows — the exact case a local-only `SELECT DISTINCT currency FROM
+// invoices` misses (a currency whose sync never landed locally at all is
+// precisely what reconciliation exists to catch, and it can't catch a
+// currency it never even considers). One list call for the whole window,
+// not one per currency — reconcileEachCurrency still lists Stripe again
+// per currency for the actual comparison, but discovering *which*
+// currencies exist doesn't need that per-currency granularity. See the
+// deep bug hunt.
+export async function discoverCurrencies(periodStart: Date, periodEnd: Date): Promise<string[]> {
+  const currencies = new Set<string>();
+  for await (const invoice of stripe.invoices.list({
+    created: { gte: toStripeSeconds(periodStart), lt: toStripeSeconds(periodEnd) },
+    limit: 100,
+  })) {
+    currencies.add(invoice.currency.toLowerCase());
+  }
+  return [...currencies].sort();
+}
+
 export interface RunReconciliationInput {
   periodStart: Date;
   periodEnd: Date;

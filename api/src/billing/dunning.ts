@@ -155,10 +155,24 @@ export async function resolveDunningOnInvoicePaid(
 
   if (!existing) return;
 
-  await tx
+  // Re-guard resolvedAt IS NULL in the UPDATE itself, not just the SELECT
+  // above - closeDunningOnSubscriptionDeleted can be racing this exact
+  // update (a payment clearing right as an admin cancels the account, or
+  // Stripe firing invoice.paid and customer.subscription.deleted close
+  // together). Whichever resolution's UPDATE commits first wins; this one
+  // becomes a safe no-op instead of overwriting it. See the deep bug hunt.
+  const [resolved] = await tx
     .update(dunningState)
     .set({ resolvedAt: input.now, resolution: 'recovered', stage: 0, nextActionAt: null })
-    .where(eq(dunningState.subscriptionId, existing.subscriptionId));
+    .where(and(eq(dunningState.subscriptionId, existing.subscriptionId), isNull(dunningState.resolvedAt)))
+    .returning({ subscriptionId: dunningState.subscriptionId });
+
+  if (!resolved) {
+    logger.info(
+      { subscriptionId: existing.subscriptionId, invoiceId: input.invoiceId },
+      'invoice.paid dunning resolution lost a race to a concurrent resolution - leaving the cycle as-is',
+    );
+  }
 }
 
 // A deleted subscription has nothing left to collect on - closes any open
@@ -175,7 +189,9 @@ export async function closeDunningOnSubscriptionDeleted(
 
   if (!existing) return;
 
-  await tx
+  // Same race guard as resolveDunningOnInvoicePaid above, for the other
+  // direction of the same race.
+  const [resolved] = await tx
     .update(dunningState)
     .set({
       stage: 4,
@@ -184,7 +200,15 @@ export async function closeDunningOnSubscriptionDeleted(
       resolvedAt: input.now,
       resolution: 'canceled',
     })
-    .where(eq(dunningState.subscriptionId, input.subscriptionId));
+    .where(and(eq(dunningState.subscriptionId, input.subscriptionId), isNull(dunningState.resolvedAt)))
+    .returning({ subscriptionId: dunningState.subscriptionId });
+
+  if (!resolved) {
+    logger.info(
+      { subscriptionId: input.subscriptionId },
+      'subscription.deleted dunning close lost a race to a concurrent resolution - leaving the cycle as-is',
+    );
+  }
 }
 
 // Escalates every cycle whose current stage's grace period has elapsed.
@@ -264,12 +288,21 @@ async function escalateDueCycles(now: Date): Promise<number> {
 // by this tick's own escalation pass. This is deliberate: it is the only
 // thing that can retry a notice stranded by a crash between a previous
 // tick's escalation transaction (which commits sent_at = null) and the
-// send confirming. Checking `sent_at is null` immediately before sending,
-// and writing sent_at right after, is what makes replaying this safe -
-// two ticks racing on the same row can both attempt the send, but only the
-// one whose write lands first (this function runs single-threaded via the
-// in-process interval, so in practice there is no race here at all, only
-// crash recovery across ticks).
+// send confirming.
+//
+// Each notice is claimed atomically (`sent_at` set via a guarded
+// `WHERE sent_at IS NULL` UPDATE, checked with `.returning()`) BEFORE the
+// email adapter is called, not after - two concurrent invocations (docs/
+// RUNBOOK.md's documented cron setup racing a stray in-process timer left
+// enabled, a slow cron run overlapping the next tick, or multiple API
+// replicas each running their own timer with DUNNING_ENABLED defaulting to
+// true) can both SELECT the same unsent row, but only one wins the claim;
+// the other sees zero rows affected and skips it without ever calling
+// emailAdapter.send() a second time. On a genuine send failure the claim is
+// reverted (`sent_at` set back to null) so a later tick can still retry it,
+// preserving the original retry behavior. See the deep bug hunt - this
+// function's old claim-free version assumed single-threaded execution the
+// codebase's own documented production paths don't actually guarantee.
 async function sendUnsentDunningNotices(): Promise<{ sent: number; failed: number }> {
   // A notice can be armed (sent_at left null) in the same window a
   // concurrent invoice.paid resolves its cycle - armNotice() and
@@ -292,6 +325,18 @@ async function sendUnsentDunningNotices(): Promise<{ sent: number; failed: numbe
   let sent = 0;
   let failed = 0;
   for (const notice of unsent) {
+    const sentAt = new Date();
+    const [claimed] = await db
+      .update(dunningNotices)
+      .set({ sentAt })
+      .where(and(eq(dunningNotices.id, notice.id), isNull(dunningNotices.sentAt)))
+      .returning({ id: dunningNotices.id });
+    if (!claimed) {
+      // Lost the claim to a concurrent invocation - it's already sending
+      // (or has already sent) this exact notice.
+      continue;
+    }
+
     try {
       await emailAdapter.send({
         subscriptionId: notice.subscriptionId,
@@ -299,21 +344,20 @@ async function sendUnsentDunningNotices(): Promise<{ sent: number; failed: numbe
         template: notice.template,
         payload: notice.payload ?? {},
       });
-      const sentAt = new Date();
-      await db.transaction(async (tx) => {
-        await tx
-          .update(dunningNotices)
-          .set({ sentAt, sendError: null })
-          .where(eq(dunningNotices.id, notice.id));
-        await tx
-          .update(dunningState)
-          .set({ lastNoticeAt: sentAt, noticesSent: sql`${dunningState.noticesSent} + 1` })
-          .where(eq(dunningState.subscriptionId, notice.subscriptionId));
-      });
+      await db
+        .update(dunningState)
+        .set({ lastNoticeAt: sentAt, noticesSent: sql`${dunningState.noticesSent} + 1` })
+        .where(eq(dunningState.subscriptionId, notice.subscriptionId));
       sent++;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await db.update(dunningNotices).set({ sendError: message }).where(eq(dunningNotices.id, notice.id));
+      // Revert the claim so a later tick retries this notice - same
+      // outcome the original send-then-mark ordering gave a real failure,
+      // just reached via claim-then-revert instead.
+      await db
+        .update(dunningNotices)
+        .set({ sentAt: null, sendError: message })
+        .where(eq(dunningNotices.id, notice.id));
       logger.error(
         { err, subscriptionId: notice.subscriptionId, stage: notice.stage },
         'dunning notice send failed',

@@ -166,18 +166,28 @@ export const invoices = pgTable(
   ],
 );
 
-export const paymentAttempts = pgTable('payment_attempts', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  invoiceId: uuid('invoice_id')
-    .notNull()
-    .references(() => invoices.id),
-  stripePaymentIntentId: text('stripe_payment_intent_id'),
-  status: text('status').notNull(), // succeeded|failed|requires_action
-  failureCode: text('failure_code'),
-  failureMessage: text('failure_message'),
-  amountMinor: integer('amount_minor').notNull(),
-  attemptedAt: timestamp('attempted_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const paymentAttempts = pgTable(
+  'payment_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    invoiceId: uuid('invoice_id')
+      .notNull()
+      .references(() => invoices.id),
+    stripePaymentIntentId: text('stripe_payment_intent_id'),
+    status: text('status').notNull(), // succeeded|failed|requires_action
+    failureCode: text('failure_code'),
+    failureMessage: text('failure_message'),
+    amountMinor: integer('amount_minor').notNull(),
+    attemptedAt: timestamp('attempted_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // A given Stripe payment_intent should only ever produce one attempt
+    // row, no matter how many times the webhook that recorded it gets
+    // reprocessed (a retry after a transient finalize failure, a reaped
+    // lease, an admin replay). See the deep bug hunt.
+    unique('payment_attempts_stripe_payment_intent_id_key').on(t.stripePaymentIntentId),
+  ],
+);
 
 export const dunningState = pgTable('dunning_state', {
   subscriptionId: uuid('subscription_id')

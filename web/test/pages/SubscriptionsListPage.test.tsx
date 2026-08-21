@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SubscriptionsListPage } from '../../src/pages/SubscriptionsListPage';
 import type { SubscriptionListRow } from '../../src/lib/types';
 import { server } from '../mswServer';
@@ -93,5 +93,62 @@ describe('SubscriptionsListPage load more pagination', () => {
     // nextCursor came back null, so the button is gone.
     expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Loading…' })).not.toBeInTheDocument();
+  });
+
+  it('discards a stale load-more page that resolves after the filter changed, instead of mixing it into the new filter\'s rows', async () => {
+    const ACTIVE_ROWS: SubscriptionListRow[] = [
+      buildRow({ id: 'sub_active_a', status: 'active', customerEmail: 'active-a@example.com' }),
+    ];
+    let releaseLoadMore: () => void = () => {};
+    const loadMoreGate = new Promise<void>((resolve) => {
+      releaseLoadMore = resolve;
+    });
+
+    server.use(
+      http.get(`${BASE_URL}/subscriptions`, async ({ request }) => {
+        const url = new URL(request.url);
+        const cursor = url.searchParams.get('cursor');
+        const statusParam = url.searchParams.get('status');
+        if (!cursor) {
+          // Cursor-less: either the initial (unfiltered) load, or the
+          // refetch useAsyncData fires once the status filter changes.
+          if (statusParam === 'active') {
+            return HttpResponse.json({ subscriptions: ACTIVE_ROWS, nextCursor: null });
+          }
+          return HttpResponse.json({ subscriptions: PAGE1_ROWS, nextCursor: 'cursor-2' });
+        }
+        // The load-more page for the ORIGINAL (unfiltered) request - held
+        // back until the filter change below has already landed, so it
+        // arrives late on purpose, reproducing the out-of-order race.
+        await loadMoreGate;
+        return HttpResponse.json({ subscriptions: PAGE2_ROWS, nextCursor: null });
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText('page1-a@example.com')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Load more' }));
+    // The load-more request is now in flight and gated on loadMoreGate.
+
+    // Change the filter while that request is still pending - this fires
+    // useAsyncData's own (unrelated, cursor-less) refetch, which resolves
+    // immediately and replaces `rows` with the new filter's single row.
+    await user.selectOptions(screen.getByLabelText('Status'), 'active');
+    expect(await screen.findByText('active-a@example.com')).toBeInTheDocument();
+    expect(screen.queryByText('page1-a@example.com')).not.toBeInTheDocument();
+
+    // Now let the stale (pre-filter-change) load-more response land.
+    releaseLoadMore();
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Loading…' })).not.toBeInTheDocument();
+    });
+
+    // The stale page's row must never appear, and the new filter's row
+    // must still be the only one shown - the stale response must not have
+    // been appended on top of it.
+    expect(screen.queryByText('page2-c@example.com')).not.toBeInTheDocument();
+    expect(screen.getByText('active-a@example.com')).toBeInTheDocument();
   });
 });

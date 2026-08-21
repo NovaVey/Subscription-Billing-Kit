@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { createPortalSession } from '../stripe/portal.js';
+import { clientIdempotencyToken } from '../stripe/idempotency.js';
 import { loadCustomerOr404 } from '../lib/lookups.js';
 import { parseOrReply } from '../lib/validate.js';
 
@@ -21,7 +22,7 @@ export async function portalRoutes(app: FastifyInstance) {
     const { url } = await createPortalSession({
       stripeCustomerId: customerRow.stripeCustomerId,
       returnUrl: return_url,
-      requestedAt: new Date(),
+      idempotency: { clientToken: clientIdempotencyToken(req), requestedAt: new Date() },
     });
 
     return reply.code(200).send({ url });

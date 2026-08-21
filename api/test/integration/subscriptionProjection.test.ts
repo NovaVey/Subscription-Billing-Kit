@@ -13,7 +13,7 @@ const { customers, subscriptionItems, subscriptionEvents, subscriptions, webhook
   '../../src/db/schema.js'
 );
 const { processPendingWebhookEvents } = await import('../../src/webhooks/processor.js');
-const { syncCustomerFromStripe } = await import('../../src/stripe/sync.js');
+const { syncCustomerFromStripe, syncSubscriptionFromStripe } = await import('../../src/stripe/sync.js');
 const { fakeCustomer, fakeEvent, fakeSubscription, fakeSubscriptionItem } = await import(
   './helpers/stripeFixtures.js'
 );
@@ -304,6 +304,66 @@ describe('an unexpected state transition is still applied and logged - Stripe is
     expect(transitionEvent).toBeDefined();
     expect(transitionEvent?.fromStatus).toBe('active');
     expect(transitionEvent?.reason).toBe('customer.subscription.updated');
+  });
+});
+
+describe('syncSubscriptionFromStripe serializes two genuinely concurrent syncs of an existing subscription (finding #5, deep bug hunt)', () => {
+  it('ends up at the newer event\'s status regardless of which of the two concurrent transactions the DB happens to run first', async () => {
+    const c = fakeCustomer();
+    await seedCustomer(c.id);
+
+    const t0 = Math.floor(Date.now() / 1000) - 200;
+    const t1 = t0 + 50;
+    const t2 = t1 + 50;
+    const stripeSubscriptionId = 'sub_test_concurrent_sync';
+
+    // Seed the row first (a prior, already-committed sync) so the race
+    // below is the realistic scenario the FOR UPDATE guard protects - two
+    // concurrent UPDATEs of an EXISTING row (e.g. an admin's
+    // resyncAfterMutation() racing the webhook worker), not two concurrent
+    // first-time inserts. (SELECT ... FOR UPDATE can't lock a row that
+    // doesn't exist yet, so a first-ever insert-vs-insert race is a
+    // different, narrower case this guard doesn't cover - it's guarded
+    // instead by the unique constraint on stripe_subscription_id.)
+    const initialSnapshot = fakeSubscription({ id: stripeSubscriptionId, customer: c.id, status: 'trialing' });
+    const seeded = await syncSubscriptionFromStripe(initialSnapshot as never, {
+      reason: 'seed',
+      lastEventAt: new Date(t0 * 1000),
+    });
+    cleanupSubscriptionIds.push(seeded.id);
+
+    const olderSnapshot = fakeSubscription({ id: stripeSubscriptionId, customer: c.id, status: 'active' });
+    const newerSnapshot = fakeSubscription({ id: stripeSubscriptionId, customer: c.id, status: 'past_due' });
+
+    // Two genuinely concurrent calls racing each other directly - not two
+    // sequential processPendingWebhookEvents() ticks like the out-of-order
+    // tests above. Whichever transaction's SELECT ... FOR UPDATE actually
+    // runs first wins the lock; FOR UPDATE + the in-transaction staleness
+    // re-check must still land on the newer event's state either way. (The
+    // older call's own return value legitimately depends on which one the
+    // DB ran first - if it runs first, its write is genuinely valid at
+    // that moment and it correctly reports 'active'; if it runs second, it
+    // loses the guard and correctly reports the row's actual 'past_due'
+    // state instead. Only the newer call's result, and the row's final
+    // state, are deterministic - asserted below.)
+    const [olderResult, newerResult] = await Promise.all([
+      syncSubscriptionFromStripe(olderSnapshot as never, { reason: 'race:older', lastEventAt: new Date(t1 * 1000) }),
+      syncSubscriptionFromStripe(newerSnapshot as never, { reason: 'race:newer', lastEventAt: new Date(t2 * 1000) }),
+    ]);
+
+    expect(olderResult.id).toBe(seeded.id);
+    expect(newerResult.id).toBe(seeded.id);
+    // The strictly-newer call must always report the status that actually
+    // won - there is no interleaving where a later, newer write ever loses
+    // to an older one.
+    expect(newerResult.toStatus).toBe('past_due');
+
+    const [row] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    expect(row?.status).toBe('past_due');
+    expect(row?.lastEventAt?.getTime()).toBe(t2 * 1000);
   });
 });
 

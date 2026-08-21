@@ -21,7 +21,9 @@ const { customers, dunningNotices, dunningState, invoices, subscriptionEvents, s
   await import('../../src/db/schema.js');
 const { handleInvoiceEvent } = await import('../../src/webhooks/handlers/invoice.js');
 const { handleSubscriptionEvent } = await import('../../src/webhooks/handlers/subscription.js');
-const { runDunningTick } = await import('../../src/billing/dunning.js');
+const { runDunningTick, resolveDunningOnInvoicePaid, closeDunningOnSubscriptionDeleted } = await import(
+  '../../src/billing/dunning.js'
+);
 const { fakeCustomer, fakeEvent, fakeInvoice, fakeSubscription } = await import('./helpers/stripeFixtures.js');
 
 const cleanupSubscriptionIds: string[] = [];
@@ -525,5 +527,163 @@ describe('subscription-deleted-closes-an-open-dunning-cycle-permanently', () => 
       ([arg]) => (arg as { subscriptionId: string }).subscriptionId === subRow.id,
     );
     expect(sendCallsForSub).toHaveLength(0);
+  });
+});
+
+describe('sendUnsentDunningNotices claims a notice atomically before sending it (finding #6, deep bug hunt)', () => {
+  it('sends an armed-but-unsent notice exactly once even when two ticks run concurrently, racing for the same notice', async () => {
+    const { subRow } = await seedCustomerAndSubscription();
+
+    // A notice already armed (sent_at null), stage not due for escalation -
+    // isolates the send-claim race from escalateDueCycles.
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 2,
+      enteredStageAt: new Date(),
+      nextActionAt: new Date(Date.now() + 7 * 86_400_000),
+    });
+    await db.insert(dunningNotices).values({
+      subscriptionId: subRow.id,
+      stage: 2,
+      channel: 'email',
+      template: 'dunning_stage_2_reminder',
+      sentAt: null,
+    });
+
+    // Two genuinely concurrent ticks - not the sequential double-call the
+    // "crash-between-notice-write-and-send" test above exercises. Both
+    // SELECT the same unsent notice before either UPDATE commits; only the
+    // guarded claim UPDATE (WHERE sent_at IS NULL ... RETURNING) lets one
+    // of them win.
+    await Promise.all([runDunningTick(), runDunningTick()]);
+
+    const sendCallsForSub = mockEmailSend.mock.calls.filter(
+      ([arg]) => (arg as { subscriptionId: string }).subscriptionId === subRow.id,
+    );
+    expect(sendCallsForSub).toHaveLength(1);
+
+    const [notice] = await db
+      .select()
+      .from(dunningNotices)
+      .where(and(eq(dunningNotices.subscriptionId, subRow.id), eq(dunningNotices.stage, 2)));
+    expect(notice?.sentAt).not.toBeNull();
+  });
+
+  it('reverts the claim (sent_at back to null) and records sendError when the send itself fails, so a later tick can retry it', async () => {
+    const { subRow } = await seedCustomerAndSubscription();
+
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 1,
+      enteredStageAt: new Date(),
+      nextActionAt: new Date(Date.now() + 7 * 86_400_000),
+    });
+    await db.insert(dunningNotices).values({
+      subscriptionId: subRow.id,
+      stage: 1,
+      channel: 'email',
+      template: 'dunning_stage_1_payment_failed',
+      sentAt: null,
+    });
+
+    mockEmailSend.mockReset();
+    mockEmailSend.mockRejectedValueOnce(new Error('smtp timeout'));
+
+    await runDunningTick();
+
+    const [afterFailure] = await db
+      .select()
+      .from(dunningNotices)
+      .where(and(eq(dunningNotices.subscriptionId, subRow.id), eq(dunningNotices.stage, 1)));
+    expect(afterFailure?.sentAt).toBeNull();
+    expect(afterFailure?.sendError).toBe('smtp timeout');
+
+    // A later tick retries it once the transient failure clears - the
+    // claim-then-revert-on-failure design must not have left the notice
+    // permanently stuck (e.g. mis-claimed as already sent).
+    mockEmailSend.mockResolvedValueOnce(undefined);
+    await runDunningTick();
+
+    const [afterRetry] = await db
+      .select()
+      .from(dunningNotices)
+      .where(and(eq(dunningNotices.subscriptionId, subRow.id), eq(dunningNotices.stage, 1)));
+    expect(afterRetry?.sentAt).not.toBeNull();
+    expect(mockEmailSend).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('resolveDunningOnInvoicePaid and closeDunningOnSubscriptionDeleted guard against racing each other (finding #8, deep bug hunt)', () => {
+  async function seedOpenCycleWithInvoice() {
+    const { customerRow, subRow } = await seedCustomerAndSubscription();
+    const [invoiceRow] = await db
+      .insert(invoices)
+      .values({
+        customerId: customerRow.id,
+        subscriptionId: subRow.id,
+        stripeInvoiceId: `in_test_race_${Math.random().toString(36).slice(2)}`,
+        status: 'open',
+        currency: 'usd',
+        amountDueMinor: 4900,
+      })
+      .returning({ id: invoices.id });
+    cleanupInvoiceIds.push(invoiceRow!.id);
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      triggeringInvoiceId: invoiceRow!.id,
+      stage: 1,
+      enteredStageAt: new Date(),
+      nextActionAt: new Date(),
+    });
+    return { subRow, invoiceRow: invoiceRow! };
+  }
+
+  it('a resolution that already committed stays as-is when a losing resolution is applied moments later (first resolution wins, not last write)', async () => {
+    const { subRow, invoiceRow } = await seedOpenCycleWithInvoice();
+
+    // invoice.paid resolves the cycle first, fully committed...
+    await db.transaction((tx) => resolveDunningOnInvoicePaid(tx, { invoiceId: invoiceRow.id, now: new Date() }));
+    const afterPaid = await getDunningState(subRow.id);
+    expect(afterPaid?.resolution).toBe('recovered');
+
+    // ...then a customer.subscription.deleted for the same subscription
+    // arrives moments later (Stripe delivery order isn't guaranteed - the
+    // cancellation could be a consequence of the very payment that just
+    // recovered the account, or unrelated). It must not overwrite the
+    // already-recorded recovery with 'canceled'.
+    await db.transaction((tx) => closeDunningOnSubscriptionDeleted(tx, { subscriptionId: subRow.id, now: new Date() }));
+    const afterDeleted = await getDunningState(subRow.id);
+    expect(afterDeleted?.resolution).toBe('recovered');
+    expect(afterDeleted?.resolvedAt?.getTime()).toBe(afterPaid?.resolvedAt?.getTime());
+  });
+
+  it('the reverse order also holds - a cancellation that already committed is never overwritten by a late payment recovery', async () => {
+    const { subRow, invoiceRow } = await seedOpenCycleWithInvoice();
+
+    await db.transaction((tx) => closeDunningOnSubscriptionDeleted(tx, { subscriptionId: subRow.id, now: new Date() }));
+    const afterDeleted = await getDunningState(subRow.id);
+    expect(afterDeleted?.resolution).toBe('canceled');
+
+    await db.transaction((tx) => resolveDunningOnInvoicePaid(tx, { invoiceId: invoiceRow.id, now: new Date() }));
+    const afterPaid = await getDunningState(subRow.id);
+    expect(afterPaid?.resolution).toBe('canceled');
+    expect(afterPaid?.resolvedAt?.getTime()).toBe(afterDeleted?.resolvedAt?.getTime());
+  });
+
+  it('lands on exactly one clean resolution, never a corrupted mixed state, when both race genuinely concurrently', async () => {
+    const { subRow, invoiceRow } = await seedOpenCycleWithInvoice();
+
+    await Promise.all([
+      db.transaction((tx) => resolveDunningOnInvoicePaid(tx, { invoiceId: invoiceRow.id, now: new Date() })),
+      db.transaction((tx) => closeDunningOnSubscriptionDeleted(tx, { subscriptionId: subRow.id, now: new Date() })),
+    ]);
+
+    const state = await getDunningState(subRow.id);
+    expect(state?.resolvedAt).not.toBeNull();
+    expect(['recovered', 'canceled']).toContain(state?.resolution);
+    // A corrupted mixed state would show up as stage/resolution disagreeing
+    // with resolvedAt's presence - 'canceled' always sets stage 4,
+    // 'recovered' always sets stage 0.
+    expect(state?.stage).toBe(state?.resolution === 'canceled' ? 4 : 0);
   });
 });

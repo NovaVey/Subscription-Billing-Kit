@@ -16,10 +16,10 @@ process.env.TZ = 'America/New_York';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ReconciliationPage } from '../../src/pages/ReconciliationPage';
 import { ToastProvider } from '../../src/components/Toast';
-import type { ReconciliationRunResult } from '../../src/lib/types';
+import type { ReconciliationRun, ReconciliationRunDetail, ReconciliationRunResult } from '../../src/lib/types';
 import { server } from '../mswServer';
 
 const BASE_URL = 'http://localhost:3000';
@@ -90,5 +90,80 @@ describe('ReconciliationPage run form period conversion', () => {
       period_end: expectedEnd,
       currency: 'eur',
     });
+  });
+});
+
+describe('ReconciliationPage drill-in race', () => {
+  it('discards a stale drill-in response that resolves after a newer drill-in was clicked', async () => {
+    const runA: ReconciliationRun = {
+      id: 'run_a',
+      periodStart: '2026-05-01T00:00:00.000Z',
+      periodEnd: '2026-05-02T00:00:00.000Z',
+      ranAt: '2026-05-02T00:05:00.000Z',
+      currency: 'usd',
+      stripeTotalMinor: 100,
+      localTotalMinor: 100,
+      invoiceCountStripe: 1,
+      invoiceCountLocal: 1,
+      mismatchCount: 1,
+    };
+    const runB: ReconciliationRun = { ...runA, id: 'run_b', ranAt: '2026-05-03T00:05:00.000Z' };
+    const detailA: ReconciliationRunDetail = {
+      ...runA,
+      report: [{ type: 'missing_local', stripeInvoiceId: 'in_stale_from_a' }],
+    };
+    const detailB: ReconciliationRunDetail = {
+      ...runB,
+      report: [{ type: 'missing_local', stripeInvoiceId: 'in_fresh_from_b' }],
+    };
+
+    let releaseA: () => void = () => {};
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+
+    server.use(
+      http.get(`${BASE_URL}/admin/reconciliation`, () => HttpResponse.json({ runs: [runA, runB] })),
+      http.get(`${BASE_URL}/admin/reconciliation/:id`, async ({ params }) => {
+        if (params['id'] === 'run_a') {
+          // Held back until run_b's drill-in (clicked after this one) has
+          // already resolved, reproducing the out-of-order arrival.
+          await gateA;
+          return HttpResponse.json(detailA);
+        }
+        return HttpResponse.json(detailB);
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <ReconciliationPage />
+      </ToastProvider>,
+    );
+
+    const drillInButtons = await screen.findAllByRole('button', { name: 'Drill in' });
+    expect(drillInButtons).toHaveLength(2);
+
+    // Click run_a's "Drill in" first - its request is now in flight and
+    // gated on gateA.
+    await user.click(drillInButtons[0]!);
+    // Click run_b's "Drill in" before run_a's response has landed.
+    await user.click(drillInButtons[1]!);
+
+    // run_b resolved immediately - its (fresher) detail is showing.
+    expect(await screen.findByText('in_fresh_from_b')).toBeInTheDocument();
+
+    // Now let run_a's stale response land.
+    releaseA();
+    await vi.waitFor(() => {
+      expect(screen.queryAllByRole('button', { name: 'Loading…' })).toHaveLength(0);
+    });
+
+    // The stale response must not have overwritten `selected` - run_b's
+    // detail (the one the user actually asked to see last) is still shown,
+    // and run_a's stale row never appears.
+    expect(screen.getByText('in_fresh_from_b')).toBeInTheDocument();
+    expect(screen.queryByText('in_stale_from_a')).not.toBeInTheDocument();
   });
 });

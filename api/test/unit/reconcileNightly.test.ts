@@ -13,7 +13,7 @@ vi.mock('../../../api/src/billing/reconcile.js', () => ({
   runReconciliation: (...args: unknown[]) => mockRunReconciliation(...args),
 }));
 
-const { reconcileEachCurrency } = await import('../../../scripts/reconcile-nightly.js');
+const { reconcileEachCurrency, mergeCurrencies } = await import('../../../scripts/reconcile-nightly.js');
 
 describe('reconcileEachCurrency', () => {
   it('runs one reconciliation per distinct currency, each with the correct window and currency', async () => {
@@ -63,5 +63,33 @@ describe('reconcileEachCurrency', () => {
     const results = await reconcileEachCurrency(window, []);
     expect(results).toEqual([]);
     expect(mockRunReconciliation).not.toHaveBeenCalled();
+  });
+});
+
+// mergeCurrencies is what closes the gap a local-only `SELECT DISTINCT`
+// currency list left: a currency Stripe invoiced but that never landed
+// locally (the sync itself is broken, or hasn't run yet) previously meant
+// the nightly job never even considered that currency, so it could never
+// surface the very drift reconciliation exists to catch. See the deep bug
+// hunt.
+describe('mergeCurrencies', () => {
+  it('includes a currency Stripe has that the local table has zero rows for', () => {
+    expect(mergeCurrencies(['usd', 'eur'], ['usd'])).toEqual(['eur', 'usd']);
+  });
+
+  it('includes a currency only the local side has, in case Stripe\'s own list misses it for some other reason', () => {
+    expect(mergeCurrencies(['usd'], ['usd', 'gbp'])).toEqual(['gbp', 'usd']);
+  });
+
+  it('de-duplicates a currency present on both sides', () => {
+    expect(mergeCurrencies(['usd', 'jpy'], ['usd', 'jpy'])).toEqual(['jpy', 'usd']);
+  });
+
+  it('normalizes case so USD and usd are not treated as two different currencies', () => {
+    expect(mergeCurrencies(['USD'], ['usd'])).toEqual(['usd']);
+  });
+
+  it('returns an empty array when both sides are empty', () => {
+    expect(mergeCurrencies([], [])).toEqual([]);
   });
 });

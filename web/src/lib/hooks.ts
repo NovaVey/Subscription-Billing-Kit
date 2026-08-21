@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type DependencyList } from 'react';
+import { useCallback, useEffect, useRef, useState, type DependencyList } from 'react';
 
 // Replaces the fetch/loading/error `useEffect` triple duplicated across
 // every page (setLoading(true); setError(null); fetchFn().then(setData)
@@ -13,14 +13,34 @@ export function useAsyncData<T>(
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // A slower, older fetch (e.g. the previous filter's request, still in
+  // flight when the filter changes and fires a new one, or a manual
+  // reload() called again before the first call resolves) can resolve
+  // *after* a newer one. Without an ordering guard, whichever response
+  // lands last wins the race and silently overwrites fresher state with
+  // stale data - every caller of this hook inherits the bug at once.
+  // Incrementing this on every reload() and only committing a response
+  // whose id still matches the latest fired request discards exactly the
+  // stale ones, regardless of arrival order. See the deep bug hunt.
+  const requestIdRef = useRef(0);
 
   const reload = useCallback(() => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     fetchFn()
-      .then(setData)
-      .catch((err: Error) => setError(err.message))
-      .finally(() => setLoading(false));
+      .then((result) => {
+        if (requestIdRef.current !== requestId) return;
+        setData(result);
+      })
+      .catch((err: Error) => {
+        if (requestIdRef.current !== requestId) return;
+        setError(err.message);
+      })
+      .finally(() => {
+        if (requestIdRef.current !== requestId) return;
+        setLoading(false);
+      });
     // fetchFn is intentionally excluded from the dependency array - callers
     // pass a fresh closure each render, and re-running only when the
     // caller's own `deps` change (not on every render) is the whole point

@@ -1,12 +1,12 @@
 import { stripe } from './client.js';
-import { checkoutSessionKey } from './idempotency.js';
+import { checkoutSessionKey, type IdempotencyContext } from './idempotency.js';
 import { env } from '../env.js';
 
 export interface CreateCheckoutSessionInput {
   stripeCustomerId: string;
   priceId: string;
   quantity: number;
-  requestedAt: Date;
+  idempotency: IdempotencyContext;
 }
 
 export async function createCheckoutSession(input: CreateCheckoutSessionInput): Promise<{ url: string }> {
@@ -23,7 +23,7 @@ export async function createCheckoutSession(input: CreateCheckoutSessionInput): 
         input.stripeCustomerId,
         input.priceId,
         input.quantity,
-        input.requestedAt,
+        input.idempotency,
       ),
     },
   );

@@ -26,11 +26,27 @@ export const EnvSchema = z.object({
   STRIPE_PORTAL_CONFIG_ID: z.string().optional(),
   APP_BASE_URL: z.string().url().default('http://localhost:5173'),
   API_BASE_URL: z.string().url().default('http://localhost:3000'),
+  // Strict-equality (`v === 'true'`) silently maps every unrecognized
+  // value - 'True', '1', 'yes', a typo - to false with no boot-time
+  // warning, indistinguishable from a deliberate "dunning off". Every
+  // subscription entering a failed-payment cycle from that point never
+  // gets escalated or notified, with nothing surfacing it. Validated
+  // against an explicit accepted set instead, case-insensitively, and
+  // fails boot loudly on anything else. See the deep bug hunt.
   DUNNING_ENABLED: z
     .string()
     .optional()
     .default('true')
-    .transform((v) => v === 'true'),
+    .transform((v, ctx) => {
+      const normalized = v.trim().toLowerCase();
+      if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+      if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+      ctx.addIssue({
+        code: 'custom',
+        message: `DUNNING_ENABLED must be one of true/false/1/0/yes/no/on/off (case-insensitive) — got "${v}"`,
+      });
+      return z.NEVER;
+    }),
   WEBHOOK_LEASE_SECONDS: z.coerce.number().int().positive().default(300),
   RECONCILE_TZ: z.string().default('UTC'),
   // Shared-secret admin access control (Phase 10) - gates every admin route

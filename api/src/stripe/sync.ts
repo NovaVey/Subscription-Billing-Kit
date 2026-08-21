@@ -183,15 +183,33 @@ export async function syncSubscriptionFromStripe(
     );
   }
 
-  const [existing] = await db
-    .select()
-    .from(subscriptions)
-    .where(eq(subscriptions.stripeSubscriptionId, subscription.id));
+  return db.transaction(async (tx) => {
+    // Re-read (and lock) the row inside this transaction, not from a
+    // pre-transaction SELECT. Two concurrent syncs of the same
+    // subscription - an admin's resyncAfterMutation() racing the webhook
+    // worker after a cancel action, or two overlapping processor ticks -
+    // must never both read the same stale fromStatus/lastEventAt and both
+    // decide to write from it. FOR UPDATE serializes them: the second
+    // transaction blocks here until the first commits, then sees the
+    // first's own write when it re-selects. See the deep bug hunt.
+    const [existing] = await tx
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, subscription.id))
+      .for('update');
 
-  const fromStatus = (existing?.status as SubscriptionStatus | undefined) ?? null;
-  const toStatus = subscription.status as SubscriptionStatus;
+    // Matches staleGuard.ts's exact semantics (skip only if strictly
+    // newer) - re-applied here because the handler-level staleGuard's own
+    // read is not atomic with this write, so a concurrent transaction can
+    // still commit a newer lastEventAt in between.
+    if (existing?.lastEventAt && existing.lastEventAt.getTime() > options.lastEventAt.getTime()) {
+      const status = existing.status as SubscriptionStatus;
+      return { id: existing.id, fromStatus: status, toStatus: status };
+    }
 
-  const localId = await db.transaction(async (tx) => {
+    const fromStatus = (existing?.status as SubscriptionStatus | undefined) ?? null;
+    const toStatus = subscription.status as SubscriptionStatus;
+
     const id = await projectSubscription(
       tx,
       subscription,
@@ -212,8 +230,6 @@ export async function syncSubscriptionFromStripe(
       });
     }
 
-    return id;
+    return { id, fromStatus, toStatus };
   });
-
-  return { id: localId, fromStatus, toStatus };
 }

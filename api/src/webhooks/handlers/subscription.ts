@@ -41,7 +41,9 @@ export async function handleSubscriptionEvent(event: Stripe.Event): Promise<Hand
   // A deleted subscription has nothing left to collect on - closes any
   // open dunning cycle as 'canceled' rather than leaving it open (§5.10).
   if (event.type === 'customer.subscription.deleted') {
-    await closeDunningOnSubscriptionDeleted(db, { subscriptionId: result.id, now: eventCreatedAt });
+    await db.transaction((tx) =>
+      closeDunningOnSubscriptionDeleted(tx, { subscriptionId: result.id, now: eventCreatedAt }),
+    );
   }
 
   return {};

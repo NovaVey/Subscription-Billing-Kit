@@ -1,0 +1,1 @@
+ALTER TABLE "payment_attempts" ADD CONSTRAINT "payment_attempts_stripe_payment_intent_id_key" UNIQUE("stripe_payment_intent_id");
