@@ -49,7 +49,13 @@ async function seedLocalInvoice(
     status: string;
     amountDueMinor: number;
     amountPaidMinor: number;
-    finalizedAt: Date;
+    // Reconciliation now windows local invoices by created_at, not
+    // finalized_at (finding #18, deep bug hunt) - every seed call below
+    // passes the same in-window instant for both, since none of these
+    // tests care about created/finalized landing in different windows
+    // (that's covered by its own test further down).
+    createdAt: Date;
+    finalizedAt: Date | null;
   },
 ) {
   const [row] = await db
@@ -61,6 +67,7 @@ async function seedLocalInvoice(
       currency: 'usd',
       amountDueMinor: overrides.amountDueMinor,
       amountPaidMinor: overrides.amountPaidMinor,
+      createdAt: overrides.createdAt,
       finalizedAt: overrides.finalizedAt,
     })
     .returning({ id: invoices.id });
@@ -95,6 +102,7 @@ describe('reconciliation-catches-a-status-drift', () => {
       status: 'open',
       amountDueMinor: invoice.amount_due,
       amountPaidMinor: invoice.amount_paid,
+      createdAt: inWindow,
       finalizedAt: inWindow,
     });
     mockInvoicesList.mockReturnValue([invoice]);
@@ -117,6 +125,7 @@ describe('reconciliation-catches-an-amount-drift', () => {
       status: 'paid',
       amountDueMinor: 1234, // corrupted
       amountPaidMinor: invoice.amount_paid,
+      createdAt: inWindow,
       finalizedAt: inWindow,
     });
     mockInvoicesList.mockReturnValue([invoice]);
@@ -154,6 +163,7 @@ describe('reconciliation-catches-a-local-invoice-stripe-has-no-record-of', () =>
       status: 'paid',
       amountDueMinor: 4200,
       amountPaidMinor: 4200,
+      createdAt: inWindow,
       finalizedAt: inWindow,
     });
     mockInvoicesList.mockReturnValue([]); // Stripe has nothing in this window
@@ -175,6 +185,7 @@ describe('a clean period stores a zero-mismatch run', () => {
       status: 'paid',
       amountDueMinor: 2900,
       amountPaidMinor: 2900,
+      createdAt: inWindow,
       finalizedAt: inWindow,
     });
     mockInvoicesList.mockReturnValue([invoice]);
@@ -189,6 +200,93 @@ describe('a clean period stores a zero-mismatch run', () => {
     expect(storedRun?.mismatchCount).toBe(0);
     expect(storedRun?.invoiceCountStripe).toBe(1);
     expect(storedRun?.invoiceCountLocal).toBe(1);
+  });
+});
+
+describe('a never-finalized draft invoice is windowed by created_at, not permanently excluded by finalized_at (finding #18, deep bug hunt)', () => {
+  it('matches a draft local row against its Stripe counterpart instead of misclassifying it missing_local', async () => {
+    const { periodStart, periodEnd, inWindow } = windowForDay(7);
+    const customerId = await seedCustomer();
+    const invoice = fakeInvoice({ status: 'draft', created: Math.floor(inWindow.getTime() / 1000) });
+    // finalizedAt is never set here - a draft invoice (auto_advance:false,
+    // e.g. a manually-finalized B2B invoice) that stays in draft forever.
+    // Windowed by finalized_at (the old behavior), this row would be
+    // excluded from EVERY possible window query, permanently misclassifying
+    // the matching Stripe invoice as missing_local. Windowed by created_at
+    // instead, it's found and correctly matched.
+    await seedLocalInvoice(customerId, {
+      stripeInvoiceId: invoice.id,
+      status: 'draft',
+      amountDueMinor: invoice.amount_due,
+      amountPaidMinor: invoice.amount_paid,
+      createdAt: inWindow,
+      finalizedAt: null,
+    });
+    mockInvoicesList.mockReturnValue([invoice]);
+
+    const result = await runReconciliation({ periodStart, periodEnd, currency: 'usd' });
+    cleanupRunIds.push(result.runId);
+
+    expect(result.entries).not.toContainEqual({ type: 'missing_local', stripeInvoiceId: invoice.id });
+    expect(result.mismatchCount).toBe(0);
+  });
+});
+
+describe('duplicate Stripe invoices across pages are deduped, never double-counted (finding #26, deep bug hunt)', () => {
+  it('counts a repeated invoice id once in invoiceCountStripe and stripeTotalMinor', async () => {
+    const { periodStart, periodEnd } = windowForDay(8);
+    const invoice = fakeInvoice({ status: 'paid', amount_due: 3000, amount_paid: 3000 });
+    // Simulates the same object surfacing twice across pagination (a real
+    // possibility when an object shifts position mid-pagination, per the
+    // documented Stripe list-pagination race) - the fix keys by id, so a
+    // repeat must never inflate the count or total.
+    mockInvoicesList.mockReturnValue([invoice, invoice]);
+
+    const result = await runReconciliation({ periodStart, periodEnd, currency: 'usd' });
+    cleanupRunIds.push(result.runId);
+
+    expect(result.invoiceCountStripe).toBe(1);
+    expect(result.stripeTotalMinor).toBe(3000);
+  });
+});
+
+describe('a live "now" period_end is clamped to a settled bound so live pagination can never silently drop an invoice (finding #26, deep bug hunt)', () => {
+  it('queries Stripe with an upper bound behind now, and stores that clamped bound rather than the raw requested one', async () => {
+    const now = new Date('2026-05-09T12:00:00.000Z');
+    const periodStart = new Date('2026-05-09T00:00:00.000Z');
+    // Requested as "now" - the common ad-hoc "reconcile since midnight" query.
+    const requestedPeriodEnd = now;
+    mockInvoicesList.mockReturnValue([]);
+
+    const result = await runReconciliation({ periodStart, periodEnd: requestedPeriodEnd, currency: 'usd', now });
+    cleanupRunIds.push(result.runId);
+
+    const [callArgs] = mockInvoicesList.mock.calls.at(-1)!;
+    const queriedLt = (callArgs as { created: { lt: number } }).created.lt;
+    // Strictly behind the requested "now", not equal to it - the whole
+    // point of the clamp.
+    expect(queriedLt).toBeLessThan(Math.floor(requestedPeriodEnd.getTime() / 1000));
+
+    const [storedRun] = await db.select().from(reconciliationRuns).where(eq(reconciliationRuns.id, result.runId));
+    // The stored record's own periodEnd reflects what was actually
+    // queried, not the raw requested value - the run's own audit trail
+    // must stay honest about what it covered.
+    expect(storedRun?.periodEnd?.getTime()).toBeLessThan(requestedPeriodEnd.getTime());
+    expect(storedRun?.periodEnd?.getTime()).toBe(queriedLt * 1000);
+  });
+
+  it('does not clamp a period_end that is already well in the past (the nightly cron\'s own case)', async () => {
+    const now = new Date('2026-05-09T12:00:00.000Z');
+    const periodStart = new Date('2026-01-01T00:00:00.000Z');
+    const periodEnd = new Date('2026-01-02T00:00:00.000Z');
+    mockInvoicesList.mockReturnValue([]);
+
+    const result = await runReconciliation({ periodStart, periodEnd, currency: 'usd', now });
+    cleanupRunIds.push(result.runId);
+
+    const [callArgs] = mockInvoicesList.mock.calls.at(-1)!;
+    const queriedLt = (callArgs as { created: { lt: number } }).created.lt;
+    expect(queriedLt).toBe(Math.floor(periodEnd.getTime() / 1000));
   });
 });
 

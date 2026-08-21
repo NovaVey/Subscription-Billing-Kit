@@ -4,11 +4,17 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const mockInvoicesRetrieve = vi.fn();
 const mockSubscriptionsRetrieve = vi.fn();
 const mockEmailSend = vi.fn();
+// syncSubscriptionFromStripe (reached via handleSubscriptionEvent) now
+// separately paginates subscription items (finding #24, deep bug hunt) -
+// nothing in this file asserts on item content, so it defaults to empty
+// via beforeEach below.
+const mockSubscriptionItemsList = vi.fn();
 
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
     invoices: { retrieve: (...args: unknown[]) => mockInvoicesRetrieve(...args) },
     subscriptions: { retrieve: (...args: unknown[]) => mockSubscriptionsRetrieve(...args) },
+    subscriptionItems: { list: (...args: unknown[]) => mockSubscriptionItemsList(...args) },
   },
 }));
 
@@ -81,6 +87,8 @@ beforeEach(() => {
   mockSubscriptionsRetrieve.mockReset();
   mockEmailSend.mockReset();
   mockEmailSend.mockResolvedValue(undefined);
+  mockSubscriptionItemsList.mockReset();
+  mockSubscriptionItemsList.mockReturnValue([]);
 });
 
 afterAll(async () => {
@@ -685,5 +693,124 @@ describe('resolveDunningOnInvoicePaid and closeDunningOnSubscriptionDeleted guar
     // with resolvedAt's presence - 'canceled' always sets stage 4,
     // 'recovered' always sets stage 0.
     expect(state?.stage).toBe(state?.resolution === 'canceled' ? 4 : 0);
+  });
+});
+
+describe('an invoice claimed before its subscription row exists is re-linked once the subscription arrives, and replayed through the dunning gate (finding #21, deep bug hunt)', () => {
+  it('links the orphaned failed invoice and opens a dunning cycle once customer.subscription.created is processed', async () => {
+    const customer = fakeCustomer();
+    const [customerRow] = await db
+      .insert(customers)
+      .values({ stripeCustomerId: customer.id, email: customer.email })
+      .returning({ id: customers.id });
+    cleanupCustomerIds.push(customerRow!.id);
+
+    // The subscription's local row does NOT exist yet - simulates
+    // processor.ts claiming this invoice.payment_failed event before the
+    // customer.subscription.created event for the same subscription
+    // (ordering is by receivedAt, not Stripe's event.created).
+    const stripeSubscriptionId = 'sub_orphan_test';
+    const failedInvoice = subscriptionLinkedInvoice(stripeSubscriptionId, customer.id, {
+      status: 'open',
+      attempt_count: 1,
+    });
+    mockInvoicesRetrieve.mockResolvedValueOnce(failedInvoice);
+    await handleInvoiceEvent(fakeEvent('invoice.payment_failed', failedInvoice) as never);
+
+    const [orphanedRow] = await db.select().from(invoices).where(eq(invoices.stripeInvoiceId, failedInvoice.id));
+    cleanupInvoiceIds.push(orphanedRow!.id);
+    expect(orphanedRow?.subscriptionId).toBeNull();
+    // The raw Stripe id is stored even though the local link isn't
+    // resolvable yet - this is what makes re-linking possible at all.
+    expect(orphanedRow?.stripeSubscriptionId).toBe(stripeSubscriptionId);
+
+    // No dunning cycle yet - there's no local subscription to attach one to.
+    const beforeLink = await db
+      .select()
+      .from(dunningState)
+      .where(eq(dunningState.triggeringInvoiceId, orphanedRow!.id));
+    expect(beforeLink).toHaveLength(0);
+
+    // Now the subscription's own creation event is processed.
+    const subscription = fakeSubscription({ id: stripeSubscriptionId, customer: customer.id });
+    mockSubscriptionsRetrieve.mockResolvedValueOnce(subscription);
+    const createdEvent = fakeEvent('customer.subscription.created', subscription);
+    cleanupWebhookEventIds.push(createdEvent.id);
+    await db.insert(webhookEvents).values({
+      stripeEventId: createdEvent.id,
+      type: createdEvent.type,
+      apiVersion: createdEvent.api_version,
+      eventCreatedAt: new Date(createdEvent.created * 1000),
+      payload: createdEvent,
+      status: 'received',
+    });
+    await handleSubscriptionEvent(createdEvent as never);
+
+    const [subRow] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    expect(subRow).toBeDefined();
+    cleanupSubscriptionIds.push(subRow!.id);
+
+    // The orphaned invoice is now linked...
+    const [relinkedRow] = await db.select().from(invoices).where(eq(invoices.id, orphanedRow!.id));
+    expect(relinkedRow?.subscriptionId).toBe(subRow!.id);
+
+    // ...and replayed through the dunning gate as if invoice.payment_failed
+    // had been processed in order - a real cycle is open, keyed to this
+    // exact invoice.
+    const state = await getDunningState(subRow!.id);
+    expect(state?.stage).toBe(1);
+    expect(state?.resolvedAt).toBeNull();
+    expect(state?.triggeringInvoiceId).toBe(orphanedRow!.id);
+  });
+
+  it('does not open a cycle for an orphaned invoice that is merely open with no failed attempts yet', async () => {
+    const customer = fakeCustomer();
+    const [customerRow] = await db
+      .insert(customers)
+      .values({ stripeCustomerId: customer.id, email: customer.email })
+      .returning({ id: customers.id });
+    cleanupCustomerIds.push(customerRow!.id);
+
+    const stripeSubscriptionId = 'sub_orphan_no_attempts';
+    // status 'open' but attempt_count 0 - freshly finalized, not yet
+    // attempted, and therefore not a failure - opening a cycle for this
+    // would be a false trigger with no actual payment problem behind it.
+    const freshInvoice = subscriptionLinkedInvoice(stripeSubscriptionId, customer.id, {
+      status: 'open',
+      attempt_count: 0,
+    });
+    mockInvoicesRetrieve.mockResolvedValueOnce(freshInvoice);
+    await handleInvoiceEvent(fakeEvent('invoice.created', freshInvoice) as never);
+    const [orphanedRow] = await db.select().from(invoices).where(eq(invoices.stripeInvoiceId, freshInvoice.id));
+    cleanupInvoiceIds.push(orphanedRow!.id);
+
+    const subscription = fakeSubscription({ id: stripeSubscriptionId, customer: customer.id });
+    mockSubscriptionsRetrieve.mockResolvedValueOnce(subscription);
+    const createdEvent = fakeEvent('customer.subscription.created', subscription);
+    cleanupWebhookEventIds.push(createdEvent.id);
+    await db.insert(webhookEvents).values({
+      stripeEventId: createdEvent.id,
+      type: createdEvent.type,
+      apiVersion: createdEvent.api_version,
+      eventCreatedAt: new Date(createdEvent.created * 1000),
+      payload: createdEvent,
+      status: 'received',
+    });
+    await handleSubscriptionEvent(createdEvent as never);
+
+    const [subRow] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    cleanupSubscriptionIds.push(subRow!.id);
+
+    const [relinkedRow] = await db.select().from(invoices).where(eq(invoices.id, orphanedRow!.id));
+    expect(relinkedRow?.subscriptionId).toBe(subRow!.id);
+
+    const state = await getDunningState(subRow!.id);
+    expect(state).toBeUndefined();
   });
 });

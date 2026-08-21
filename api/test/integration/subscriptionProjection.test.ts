@@ -2,9 +2,20 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockRetrieve = vi.fn();
+// projectSubscription now sources items from a separately-paginated
+// subscriptionItems.list() call, not subscription.items.data (finding
+// #24, deep bug hunt) - every test below that doesn't itself care about
+// item content gets the beforeEach default ([]); the two that do
+// (period-projection, mixed-interval) set their own return value
+// alongside the matching mockRetrieve call. Returned as a plain array,
+// not a resolved Promise - sync.ts's `for await` consumes it as a sync
+// iterable, matching the ApiListPromise auto-pagination shape the real
+// SDK returns (a Promise wouldn't have Symbol.asyncIterator).
+const mockSubscriptionItemsList = vi.fn();
 vi.mock('../../src/stripe/client.js', () => ({
   stripe: {
     subscriptions: { retrieve: (...args: unknown[]) => mockRetrieve(...args) },
+    subscriptionItems: { list: (...args: unknown[]) => mockSubscriptionItemsList(...args) },
   },
 }));
 
@@ -13,7 +24,9 @@ const { customers, subscriptionItems, subscriptionEvents, subscriptions, webhook
   '../../src/db/schema.js'
 );
 const { processPendingWebhookEvents } = await import('../../src/webhooks/processor.js');
-const { syncCustomerFromStripe, syncSubscriptionFromStripe } = await import('../../src/stripe/sync.js');
+const { syncCustomerFromStripe, syncSubscriptionFromStripe, TIERED_PRICING_SENTINEL_MINOR } = await import(
+  '../../src/stripe/sync.js'
+);
 const { fakeCustomer, fakeEvent, fakeSubscription, fakeSubscriptionItem } = await import(
   './helpers/stripeFixtures.js'
 );
@@ -45,6 +58,8 @@ async function insertReceivedEvent(event: { id: string; type: string; created: n
 
 beforeEach(() => {
   mockRetrieve.mockReset();
+  mockSubscriptionItemsList.mockReset();
+  mockSubscriptionItemsList.mockReturnValue([]);
 });
 
 afterAll(async () => {
@@ -74,6 +89,7 @@ describe('subscription periods are read from items, not from the subscription', 
     const item = fakeSubscriptionItem();
     const subscription = fakeSubscription({ customer: stripeCustomerId, items: { data: [item] } });
     mockRetrieve.mockResolvedValueOnce(subscription);
+    mockSubscriptionItemsList.mockReturnValueOnce([item]);
 
     const event = fakeEvent('customer.subscription.created', subscription);
     await insertReceivedEvent(event);
@@ -117,6 +133,7 @@ describe('a mixed-interval subscription stores a period per item', () => {
       items: { data: [monthlyItem, annualItem] },
     });
     mockRetrieve.mockResolvedValueOnce(subscription);
+    mockSubscriptionItemsList.mockReturnValueOnce([monthlyItem, annualItem]);
 
     const event = fakeEvent('customer.subscription.created', subscription);
     await insertReceivedEvent(event);
@@ -142,6 +159,76 @@ describe('a mixed-interval subscription stores a period per item', () => {
 
     // next_period_end_derived is the minimum of the two - the monthly one.
     expect(subRow?.nextPeriodEndDerived?.getTime()).toBe(monthlyItem.current_period_end * 1000);
+  });
+});
+
+describe('item projection reads the full, separately-paginated item list, not the truncated retrieve() page (finding #24, deep bug hunt)', () => {
+  it('stores all 12 items when the subscription has more than the default page size of 10', async () => {
+    const c = fakeCustomer();
+    await seedCustomer(c.id);
+
+    const allItems = Array.from({ length: 12 }, () => fakeSubscriptionItem());
+    // retrieve() itself is truncated to the first 10 (Stripe's own default
+    // page size, with no way to ask retrieve() for more - see the comment
+    // on listAllSubscriptionItems) - the fix means projectSubscription must
+    // never read from this truncated list for item content.
+    const subscription = fakeSubscription({ customer: c.id, items: { data: allItems.slice(0, 10) } });
+    mockRetrieve.mockResolvedValueOnce(subscription);
+    // subscriptionItems.list, by contrast, returns the complete list - this
+    // is the one the fix must actually use.
+    mockSubscriptionItemsList.mockReturnValueOnce(allItems);
+
+    const event = fakeEvent('customer.subscription.created', subscription);
+    await insertReceivedEvent(event);
+    await processPendingWebhookEvents();
+
+    const [subRow] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, subscription.id));
+    cleanupSubscriptionIds.push(subRow!.id);
+
+    const items = await db.select().from(subscriptionItems).where(eq(subscriptionItems.subscriptionId, subRow!.id));
+    expect(items).toHaveLength(12);
+    // None of the 12 were spuriously marked removed - the removal-detection
+    // step's own currentStripeItemIds must also come from the full list.
+    expect(items.every((i) => i.removedAt === null)).toBe(true);
+  });
+});
+
+describe('unit_amount_minor stores a sentinel for tiered/graduated/package pricing rather than silently reading as 0 (finding #19, deep bug hunt)', () => {
+  it('stores TIERED_PRICING_SENTINEL_MINOR when the price has no flat unit_amount', async () => {
+    const c = fakeCustomer();
+    await seedCustomer(c.id);
+
+    const flatItem = fakeSubscriptionItem({
+      price: { id: 'price_flat', object: 'price', currency: 'usd', unit_amount: 1500, recurring: { interval: 'month' }, metadata: {} },
+    });
+    const tieredItem = fakeSubscriptionItem({
+      price: { id: 'price_tiered', object: 'price', currency: 'usd', unit_amount: null, billing_scheme: 'tiered', recurring: { interval: 'month' }, metadata: {} },
+    });
+    const subscription = fakeSubscription({ customer: c.id, items: { data: [flatItem, tieredItem] } });
+    mockRetrieve.mockResolvedValueOnce(subscription);
+    mockSubscriptionItemsList.mockReturnValueOnce([flatItem, tieredItem]);
+
+    const event = fakeEvent('customer.subscription.created', subscription);
+    await insertReceivedEvent(event);
+    await processPendingWebhookEvents();
+
+    const [subRow] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, subscription.id));
+    cleanupSubscriptionIds.push(subRow!.id);
+
+    const items = await db.select().from(subscriptionItems).where(eq(subscriptionItems.subscriptionId, subRow!.id));
+    const flatRow = items.find((i) => i.stripeItemId === flatItem.id);
+    const tieredRow = items.find((i) => i.stripeItemId === tieredItem.id);
+    expect(flatRow?.unitAmountMinor).toBe(1500);
+    // Never 0 - that would look like a real, free-tier price rather than
+    // "this amount genuinely isn't representable as one flat number".
+    expect(tieredRow?.unitAmountMinor).toBe(TIERED_PRICING_SENTINEL_MINOR);
+    expect(tieredRow?.unitAmountMinor).not.toBe(0);
   });
 });
 

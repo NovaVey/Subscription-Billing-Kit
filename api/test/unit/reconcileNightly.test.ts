@@ -29,8 +29,8 @@ describe('reconcileEachCurrency', () => {
     expect(mockRunReconciliation).toHaveBeenNthCalledWith(2, { ...window, currency: 'jpy' });
 
     expect(results).toEqual([
-      { currency: 'usd', result: expect.objectContaining({ runId: 'run-usd' }) },
-      { currency: 'jpy', result: expect.objectContaining({ runId: 'run-jpy' }) },
+      { currency: 'usd', result: expect.objectContaining({ runId: 'run-usd' }), error: null },
+      { currency: 'jpy', result: expect.objectContaining({ runId: 'run-jpy' }), error: null },
     ]);
   });
 
@@ -63,6 +63,28 @@ describe('reconcileEachCurrency', () => {
     const results = await reconcileEachCurrency(window, []);
     expect(results).toEqual([]);
     expect(mockRunReconciliation).not.toHaveBeenCalled();
+  });
+
+  // Error isolation (finding #23, deep bug hunt): before this fix, a
+  // thrown error from any single currency propagated straight out of the
+  // loop, aborting every remaining currency with no partial persistence.
+  it('isolates one currency\'s failure - the remaining currencies still run, and the failure is reported rather than thrown', async () => {
+    mockRunReconciliation.mockReset();
+    mockRunReconciliation
+      .mockResolvedValueOnce({ runId: 'run-usd', mismatchCount: 0, stripeTotalMinor: 100, localTotalMinor: 100, invoiceCountStripe: 1, invoiceCountLocal: 1, entries: [] })
+      .mockRejectedValueOnce(new Error('stripe 500 mid-pagination'))
+      .mockResolvedValueOnce({ runId: 'run-gbp', mismatchCount: 0, stripeTotalMinor: 50, localTotalMinor: 50, invoiceCountStripe: 1, invoiceCountLocal: 1, entries: [] });
+
+    const window = { periodStart: new Date('2026-05-01T00:00:00Z'), periodEnd: new Date('2026-05-02T00:00:00Z') };
+    const results = await reconcileEachCurrency(window, ['usd', 'jpy', 'gbp']);
+
+    // All three were attempted - jpy's failure didn't stop gbp from running.
+    expect(mockRunReconciliation).toHaveBeenCalledTimes(3);
+    expect(results).toEqual([
+      { currency: 'usd', result: expect.objectContaining({ runId: 'run-usd' }), error: null },
+      { currency: 'jpy', result: null, error: 'stripe 500 mid-pagination' },
+      { currency: 'gbp', result: expect.objectContaining({ runId: 'run-gbp' }), error: null },
+    ]);
   });
 });
 

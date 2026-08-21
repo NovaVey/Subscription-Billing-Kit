@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { customers, dunningState, invoices, subscriptionEvents, subscriptions } from '../db/schema.js';
 import { loadSubscriptionOr404 } from '../lib/lookups.js';
-import { parseOrReply } from '../lib/validate.js';
+import { parseOrReply, parseUuidParam } from '../lib/validate.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -63,7 +63,8 @@ export async function dunningRoutes(app: FastifyInstance) {
   // no admin mutation may bypass the audit trail), even though resolving
   // dunning doesn't itself change subscriptions.status.
   app.post('/dunning/:id/resolve', async (req, reply) => {
-    const { id } = req.params as { id: string };
+    const id = parseUuidParam(req, reply);
+    if (!id) return;
     const body = parseOrReply(ResolveBody, req.body, reply);
     if (!body) return;
     const { resolution, note } = body;

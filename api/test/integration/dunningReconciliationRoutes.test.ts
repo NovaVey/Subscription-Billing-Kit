@@ -206,6 +206,16 @@ describe('POST /dunning/:id/resolve', () => {
     expect(response.statusCode).toBe(400);
   });
 
+  it('rejects a malformed :id with 400 rather than a raw Postgres error (finding #17, deep bug hunt)', async () => {
+    const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
+      method: 'POST',
+      url: '/dunning/not-a-uuid/resolve',
+      payload: { resolution: 'manual', note: 'n/a' },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
   it('lets exactly one of two concurrent resolve requests for the same cycle succeed (finding #7, deep bug hunt)', async () => {
     // A double-submitted click, or two operators resolving the same
     // subscription at once - a plain SELECT-then-UPDATE would let both
@@ -355,6 +365,15 @@ describe('GET /admin/reconciliation/:id', () => {
     });
     expect(response.statusCode).toBe(404);
   });
+
+  it('rejects a malformed :id with 400 rather than a raw Postgres error (finding #17, deep bug hunt)', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/admin/reconciliation/not-a-uuid',
+      headers: WRITE_KEY_HEADERS,
+    });
+    expect(response.statusCode).toBe(400);
+  });
 });
 
 describe('POST /admin/reconciliation/run', () => {
@@ -373,7 +392,10 @@ describe('POST /admin/reconciliation/run', () => {
       // reconciliation.test.ts's windowForDay comment) - runReconciliation
       // fetches every local invoice in the period+currency, so a shared day
       // would pick up another test's leftover row as a false orphan_local.
-      finalizedAt: new Date('2026-09-20T12:00:00Z'),
+      // createdAt is what the local-side window now filters by (finding
+      // #18, deep bug hunt) - finalizedAt alone no longer suffices.
+      createdAt: new Date('2026-05-20T12:00:00Z'),
+      finalizedAt: new Date('2026-05-20T12:00:00Z'),
     });
     const [insertedInvoiceRow] = await db
       .select()
@@ -386,8 +408,13 @@ describe('POST /admin/reconciliation/run', () => {
       method: 'POST',
       url: '/admin/reconciliation/run',
       payload: {
-        period_start: '2026-09-20T00:00:00.000Z',
-        period_end: '2026-09-20T23:59:59.000Z',
+        // Safely in the past (see reconcile.ts's LIVE_WINDOW_BUFFER_MS,
+        // finding #26 deep bug hunt) - a period_end near real wall-clock
+        // "now" would get clamped to a settled bound behind it, which
+        // this test doesn't exercise (see reconciliation.test.ts's own
+        // dedicated clamp tests for that).
+        period_start: '2026-05-20T00:00:00.000Z',
+        period_end: '2026-05-20T23:59:59.000Z',
         currency: 'usd',
       },
     });

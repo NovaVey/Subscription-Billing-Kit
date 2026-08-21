@@ -16,6 +16,7 @@ function buildRow(overrides: Partial<SubscriptionListRow>): SubscriptionListRow 
     planCode: 'pro_monthly',
     currency: 'usd',
     mrrMinor: 1900,
+    hasTieredPricing: false,
     nextPeriodEndDerived: '2026-09-20T00:00:00.000Z',
     dunningStage: 0,
     customerEmail: 'default@example.com',
@@ -150,5 +151,26 @@ describe('SubscriptionsListPage load more pagination', () => {
     // been appended on top of it.
     expect(screen.queryByText('page2-c@example.com')).not.toBeInTheDocument();
     expect(screen.getByText('active-a@example.com')).toBeInTheDocument();
+  });
+});
+
+describe('tiered pricing indicator (finding #19, deep bug hunt)', () => {
+  it('shows the tiered-pricing note next to MRR when hasTieredPricing is true, and hides it otherwise', async () => {
+    server.use(
+      http.get(`${BASE_URL}/subscriptions`, () =>
+        HttpResponse.json({
+          subscriptions: [
+            buildRow({ id: 'sub_tiered', customerEmail: 'tiered@example.com', hasTieredPricing: true }),
+            buildRow({ id: 'sub_flat', customerEmail: 'flat@example.com', hasTieredPricing: false }),
+          ],
+          nextCursor: null,
+        }),
+      ),
+    );
+
+    renderPage();
+
+    expect(await screen.findByText('tiered@example.com')).toBeInTheDocument();
+    expect(screen.getAllByText('tiered pricing excluded')).toHaveLength(1);
   });
 });

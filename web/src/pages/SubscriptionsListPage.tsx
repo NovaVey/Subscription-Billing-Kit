@@ -147,6 +147,14 @@ export function SubscriptionsListPage() {
                 </td>
                 <td className="py-2 pr-4">
                   <Amount minor={row.mrrMinor} currency={row.currency} className="block" />
+                  {row.hasTieredPricing && (
+                    <div
+                      className="text-right text-xs text-ink/40"
+                      title="One or more items use tiered/graduated/package pricing - MRR excludes them and understates the true total"
+                    >
+                      tiered pricing excluded
+                    </div>
+                  )}
                 </td>
                 <td className="num py-2 pr-4 text-right">{formatDateOnly(row.nextPeriodEndDerived)}</td>
                 <td className="py-2 pr-4">

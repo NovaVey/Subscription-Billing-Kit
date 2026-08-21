@@ -87,7 +87,7 @@ export async function handleInvoiceEvent(event: Stripe.Event): Promise<HandlerRe
     if (!localSubscriptionId) {
       logger.warn(
         { stripeInvoiceId, stripeSubscriptionId },
-        'invoice references a subscription with no local row yet — storing invoice without the link for now',
+        'invoice references a subscription with no local row yet — storing invoice without the link for now, to be re-linked once the subscription row exists (see relinkOrphanedInvoices in sync.ts)',
       );
     }
   }
@@ -95,10 +95,15 @@ export async function handleInvoiceEvent(event: Stripe.Event): Promise<HandlerRe
   const row = {
     customerId: customerRow.id,
     subscriptionId: localSubscriptionId,
+    // Stored even when localSubscriptionId is still null - the only way
+    // relinkOrphanedInvoices (sync.ts) can ever find this row again once
+    // the subscription's local row is created. See the deep bug hunt.
+    stripeSubscriptionId: stripeSubscriptionId ?? null,
     stripeInvoiceId: invoice.id!,
     number: invoice.number,
     status: invoice.status ?? 'draft',
     currency: invoice.currency,
+    createdAt: fromStripeSeconds(invoice.created),
     amountDueMinor: invoice.amount_due,
     amountPaidMinor: invoice.amount_paid,
     attemptCount: invoice.attempt_count,
