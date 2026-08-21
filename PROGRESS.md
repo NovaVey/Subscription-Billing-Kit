@@ -517,3 +517,124 @@ Manually proved both directions: ran it against a healthy local instance (43/44 
 **Files touched:** `scripts/smoke-test.ts` (new), `package.json` (root, `smoke-test` script), `docs/RUNBOOK.md`, `README.md` (repo layout).
 
 **Verification:** typecheck/lint clean; 63/63 unit + 120/120 integration tests unaffected (no test files touched — this is a standalone operational script). Manually run against both a healthy and a stopped local instance, as described above.
+
+## Infrastructure: two real bugs found recording a live admin-UI walkthrough
+
+**Date:** 2026-07-29
+
+Recording a full admin-UI walkthrough with a real browser (not `app.inject`, which was the blind spot both times) surfaced two genuine bugs, both fixed and verified the same way before shipping:
+
+- **Confirm before canceling.** Both cancel actions (at period end, immediately) fired straight to the API with no confirmation step — the only mutating action in the admin UI without one. Added a confirmation dialog naming what's about to happen, reusing the existing `Modal` component (the same pattern the plan-change flow already used).
+- **`Content-Type: application/json` sent on bodyless requests.** `resumeSubscription()` and `replayWebhookEvent()` both `POST` with no body, but `web/src/lib/api.ts`'s `request()` unconditionally sent the header regardless. Fastify's default JSON body parser rejects that exact combination (`FST_ERR_CTP_EMPTY_JSON_BODY`), so the Resume and Replay buttons were both failing with a 400 in a real browser — invisible to every existing test, since `app.inject` never sends that header without a payload either. Fixed by only setting the header when a body is actually present. Confirmed at the HTTP level with `curl` before and after.
+
+**Files touched:** `web/src/pages/SubscriptionDetailPage.tsx` (cancel confirmation), `web/src/lib/api.ts` (Content-Type fix).
+
+**Verification:** typecheck/lint clean; existing suites unaffected. Both fixes confirmed against a real running instance, not just `app.inject` — which is exactly why `app.inject`-only testing missed them the first time.
+
+## Post-Phase-10 addition — `/improve` workflow: code quality, efficiency, refactors, docs accuracy, test coverage
+
+**Date:** 2026-08-20
+
+**Status:** Complete, all six batches shipped in one PR (#18). A reusable `/improve` workflow was authored first — a standing audit (not a one-time script) that any future session can re-run — then executed once against the whole codebase as it stood after Phase 10 and the walkthrough fixes above. 72 files changed, ~6,430 insertions.
+
+**Batch 1 — 3 real bugs found by the audit, all with regression tests:**
+- `dunning.ts` `sendUnsentDunningNotices()` no longer sends a notice whose owning cycle already resolved — was sending stale "payment failed" emails to customers who'd already paid.
+- Re-opening a resolved dunning cycle now clears prior-cycle notice rows, so the new cycle's stage 2/3 notices aren't silently blocked by `onConflictDoNothing` hitting a leftover row from the old cycle.
+- `reconcile.ts`'s Stripe-side invoice query window is now half-open `[periodStart, periodEnd)`, matching the local query — an invoice on a shared boundary between two adjacent runs could previously be double-counted.
+
+**Batch 2 — efficiency fixes:**
+- 5 missing indexes added (`subscription_events.subscription_id`, `subscriptions.created_at`, `invoices.customer_id`, `invoices.period_start`, `webhook_events.received_at`) plus the migration, applied and verified locally.
+- `GET /subscriptions/:id`: the 4 independent queries that don't depend on the initial row lookup now run in parallel (6 sequential round trips → 2 stages).
+- `stripe/sync.ts` bulk-upserts subscription items in one statement instead of one insert-on-conflict round trip per item.
+- Dunning escalation batches by `fromStage` (max 3 groups) instead of one transaction per due cycle, with one multi-row notice insert per group.
+- `GET /admin/webhook-events` and `GET /admin/reconciliation` list views no longer ship the full `payload`/`report` JSONB for every row; new `GET .../:id` detail routes are fetched on demand (the admin UI now lazy-loads payload on expand / report on drill-in instead of pulling it upfront).
+
+**Batch 3 (+ 3b) — simplification refactors, all behavior-preserving:**
+- `lib/validate.ts`'s `parseOrReply()` replaces the safeParse-plus-400 block duplicated across 11 route handlers.
+- `lib/lookups.ts`'s `loadSubscriptionOr404()`/`loadCustomerOr404()` replace the select-plus-404 block duplicated across 6 and 2 route handlers.
+- `stripe/refs.ts`'s `resolveId()` replaces an identical helper duplicated in the invoice and paymentIntent webhook handlers.
+- `webhooks/ledger.ts`'s `resetWebhookEventForReplay()` replaces an identical update duplicated between the admin replay route and `scripts/replay-event.ts`.
+- `webhooks/handlers/staleGuard.ts`'s `staleGuard()` replaces the near-identical staleness-guard block duplicated between the subscription and invoice handlers.
+- Two frontend refactors (Batch 3b) were deliberately held back until Batch 6 gave `/web` real test coverage to refactor against, then done last: `lib/hooks.ts`'s `useAsyncData()` replaces the fetch/loading/error `useEffect` triple duplicated across all 6 pages, and `useAsyncAction()` replaces the set-busy/await/clear-busy skeleton duplicated across every mutation handler — taking its action at call time rather than binding it up front, specifically so `SubscriptionDetailPage`'s single shared busy flag across three different mutations (plan change, cancel, resume) still disables all three correctly while any one is in flight. `SubscriptionsListPage`'s `loadMore` keeps its own hand-rolled append logic (appending doesn't fit the hook's replace-on-fetch shape), matching a caveat the audit itself flagged.
+
+**Batch 4 — 2 docs-accuracy corrections:** `docs/ARCHITECTURE.md` and `docs/STATE-MACHINE.md` both claimed the admin UI's event timeline renders unexpected state transitions differently from expected ones. It doesn't — `SubscriptionDetailPage.tsx` renders every row identically, and `isExpectedTransition()` is never called from `/web`. Aspirational planning text that was never implemented and never corrected; both docs now state the actual behavior.
+
+**Batch 5 — 15 backend test-coverage gaps closed:** state-machine unexpected-transition write-through, dunning re-open (`closeDunningOnSubscriptionDeleted`), invoice staleness guard for out-of-order delivery, deleted-draft-invoice 404 cleanup, `customer.deleted` no-op, `computeBackoffSeconds` plus the processor retry/backoff path, `dispatch()` fallthrough for unknown event types, `money.ts` negative amounts and rounding boundaries, `reconcile.ts` DST-transition window behavior, `computeMrrMinor` non-monthly intervals, 404/409 paths on subscription mutation routes, `idempotency.ts` `buildKey` colon-collision, `syncCustomerFromStripe` `externalRef` preservation, `reconcile-nightly.ts`'s per-currency loop (extracted and guarded for testability), and `worker.ts` interval wiring. Two incidental corrections surfaced by writing these tests (comments/tests only, no behavior change): `computeBackoffSeconds`'s comment claimed a 3600s cap the actual formula can never reach (plateaus at 1920s), corrected; `computeYesterdayWindow`'s DST-transition handling doesn't vary window *length* as originally assumed — it stays exactly 24h but misaligns the boundary by 1 hour on transition days — tests now pin the real, documented (§5.11), accepted behavior instead of an incorrect assumption.
+
+**Batch 6 — stood up `/web`'s test infrastructure from zero, plus 15 frontend tests:** `web/` had no test files, no runner config, and no test script before this. Wired `vitest` + `@testing-library/react` + `@testing-library/user-event` + `jest-dom` + `jsdom` + `msw` into a dedicated `web/vitest.config.ts`, with `web/test/setup.ts` (matchers, MSW lifecycle, RTL cleanup) and `web/test/mswServer.ts` (shared MSW node server). `web/tsconfig.test.json` plus a hand-written `web/test/vitest-matchers.d.ts` work around a real npm-workspace dual-`vitest`-instance issue that broke `jest-dom`'s own type augmentation, documented in the file. Added the root `test:web` script and a CI step. 15 tests across 6 new files cover `api.ts`'s `request()` (Content-Type omission, 401/403 handling, malformed error fallback), `SubscriptionDetailPage`'s cancel-confirmation and plan-change flows (plus a real bug found and fixed: editing the form after previewing left a stale proration total with Apply still enabled — fixed by clearing the preview on any field edit), `SubscriptionsListPage`'s load-more pagination, `ReconciliationPage`'s datetime-local-to-ISO conversion, `DunningQueuePage`'s resolve-note whitespace guard, and `WebhookLogPage`'s per-row replay busy-state scoping.
+
+**Infrastructure alongside this batch:** `.github/dependabot.yml` (weekly npm, workspaces-aware, and github-actions dependency checks) and `.github/workflows/codeql.yml` (CodeQL advanced-setup for javascript-typescript, on push/PR to main plus a weekly schedule) were both added in the same PR.
+
+**Verification:** typecheck, lint, and both workspace builds clean throughout. Final state: 76 unit + 149 integration (backend) + 29 web = 254 tests, all green.
+
+**Open items:** none new from this pass.
+
+## Dependabot maintenance — PRs #19–26
+
+**Date:** 2026-08-20
+
+Eight Dependabot PRs opened by the config added above (`actions/checkout` 4→7, `typescript` 5.9.3→7.0.2, `@typescript-eslint/parser` 8.65.0→8.67.0, `vite` 8.1.5→8.2.1, `@testing-library/jest-dom` 6.9.1→7.0.1, `github/codeql-action` 3→4, `actions/setup-node` 4→7, `pg`/`@types/pg` 8.22.0→8.23.0/8.23.1) were merged in order, each only after its own CI ran green — no batch-merge, no skipped checks.
+
+## Deep bug-hunt audit — critical severity (PR #27)
+
+**Date:** 2026-08-21
+
+**Status:** Complete, merged. A 10-dimension, adversarially-verified audit (128 agents, 39 candidate findings, 117/117 verify votes unanimous) ran against the system as a whole — the first audit of this project not scoped to a single phase or the `/improve` checklist. It surfaced 3 critical, 12 high, and 14 medium-severity findings (29 total), fixed in three successive PRs following the identical fix → test → verify discipline. This entry covers the critical batch.
+
+1. **Webhook status transitions had no compare-and-swap guard.** The reaper and the admin "Replay" endpoint could both race a still-alive handler and double-dispatch the same Stripe event: a handler that outlives its lease (a slow Stripe call, DB contention) could be reaped mid-flight and reprocessed concurrently, and whichever write landed last would silently clobber the other's terminal status. `reaper.ts`'s requeue/park updates and `processor.ts`'s finalize updates now only take effect if the row is still exactly the lease they claimed (`status='processing'` AND the same `processingStartedAt`); `claimBatch` now returns the claim UPDATE's own `.returning()` rows instead of the pre-claim SELECT (the pre-update read was a latent bug that would've defeated the guard); `resetWebhookEventForReplay` now refuses to touch a row that's currently `processing` (409 from the route, an error exit from `scripts/replay-event.ts`) instead of unconditionally resetting it.
+2. **Server crashed on boot when `API_BASE_URL` was set to the real public URL** — exactly what `docs/RUNBOOK.md` instructs operators to do outside dev. The listener bound to that URL's *hostname* literally; a PaaS's public hostname is DNS/proxy-routed, never present on any local interface to bind to. Extracted a pure, unit-tested `resolveListenTarget()` that always binds every interface (`0.0.0.0`) — only the port comes from `API_BASE_URL` now. Confirmed via Railway that this repo's own production deployment doesn't currently have `API_BASE_URL` set, which is exactly why this hadn't fired yet — latent, not hypothetical.
+3. **A canceled dunning cycle could be reopened by a late, out-of-order webhook.** `openDunningCycleOnPaymentFailed` could reopen a cycle already closed as `canceled` by `customer.subscription.deleted`, if a late/out-of-order `invoice.payment_failed` for that subscription's final invoice arrived afterward — emailing a customer about a subscription Stripe already reports gone. A cycle resolved as `canceled` is now treated as terminal and never reopened.
+
+**Files touched:** `webhooks/reaper.ts`, `webhooks/processor.ts`, `webhooks/ledger.ts`, `scripts/replay-event.ts`, `routes/webhookEvents.ts`, `lib/listenTarget.ts` (new), `index.ts`, `billing/dunning.ts`, plus new/updated tests in `listenTarget.test.ts` (new), `dunning.test.ts`, `reaperRecovery.test.ts`, `adminEndpoints.test.ts`.
+
+**Verification:** typecheck, lint, both workspace builds, and the full suite green: 79 unit + 153 integration + 29 web tests.
+
+## Deep bug-hunt audit — high severity (PR #28)
+
+**Date:** 2026-08-21
+
+**Status:** Complete, merged. Follow-up to PR #27, same discipline, all 12 high-severity findings.
+
+**Backend concurrency (findings #4–#8), the same compare-and-swap pattern established for the criticals** — fold the "still in the expected state" check into the write's own `WHERE` clause (or `SELECT ... FOR UPDATE` plus an in-transaction re-check) instead of a separate pre-write `SELECT`:
+- `payment_attempts` gained a unique constraint on `stripe_payment_intent_id` plus `onConflictDoNothing`, making the insert genuinely idempotent instead of relying on a non-atomic SELECT-then-INSERT.
+- `sync.ts`/`invoice.ts`: `syncSubscriptionFromStripe` and `handleInvoiceEvent` both re-read the row inside their transaction with `FOR UPDATE` and re-check staleness there, matching `staleGuard.ts`'s exact semantics — the handler-level read alone wasn't atomic with the write.
+- `dunning.ts`'s `sendUnsentDunningNotices`: each notice is claimed via a guarded `WHERE sent_at IS NULL` UPDATE before the email adapter is ever called, with the claim reverted on a genuine send failure so retry behavior is preserved.
+- `routes/dunning.ts`'s `POST /dunning/:id/resolve`: the "not already resolved" check now lives in the resolving UPDATE's `WHERE` clause, so two concurrent resolve requests can't both pass a stale check and both commit.
+- `resolveDunningOnInvoicePaid`/`closeDunningOnSubscriptionDeleted`: the same guarded-UPDATE-with-`.returning()` pattern so the two functions can safely race each other without one silently overwriting the other's resolution.
+
+**Outbound idempotency (#9):** every Stripe-mutating call site now takes an `IdempotencyContext` instead of a bare `requestedAt` — a caller-supplied `Idempotency-Key` header always wins when present, with the fallback bucketed to the minute rather than fresh-every-request or stable-forever. Also fixed `buildKey`'s own pinned known-risk test: the part-join now escapes each part before joining, so a colon inside one part can no longer shift the boundary onto a neighboring part and collide two different operations' keys.
+
+**Config and misc (#10–#12):** `DUNNING_ENABLED` now validates against an explicit accepted set instead of silently mapping any unrecognized value to `false`; `reconcile-nightly.ts`'s per-currency loop now unions Stripe's own currency list for the window with the local distinct-currency query, so a currency with zero local rows still gets checked; the ESM main-module guard now compares against `pathToFileURL(process.argv[1]).href` instead of a hand-rolled template string, which was wrong on Windows.
+
+**Frontend stale-response races (#13–#15),** all via "track the request that's actually still wanted, discard anything else that lands": `useAsyncData` uses an incrementing request id to discard a response from a superseded fetch regardless of arrival order; `SubscriptionsListPage`'s `loadMore()` captures the active filters at fire time and discards the response if they no longer match once it resolves; `ReconciliationPage`'s `handleDrillIn()` tracks the most recently clicked run id and discards a response a newer click has since superseded.
+
+**Files touched:** `webhooks/processor.ts`, `sync.ts`, `invoice.ts` handler, `billing/dunning.ts`, `routes/dunning.ts`, `stripe/idempotency.ts`, `lib/envSchema.ts`, `scripts/reconcile-nightly.ts`, `db/schema.ts` (payment_attempts unique constraint + migration), `web/src/lib/hooks.ts`, `web/src/pages/SubscriptionsListPage.tsx`, `web/src/pages/ReconciliationPage.tsx`, plus tests across the same surfaces including genuine concurrent-call races (`Promise.all` against the real test database) for #4–#8 and out-of-order-response races via controlled msw/promise gating for #13–#15.
+
+**Verification:** typecheck, lint, both workspace builds, full suite green: 111 unit + 162 integration + 33 web tests.
+
+**Known operational risk, disclosed, not resolved in this PR:** the new `payment_attempts` unique-constraint migration would fail to apply if the live database already had duplicate `stripe_payment_intent_id` values — the exact bug #4 fixes — not verified against production ahead of the deploy, since the database wasn't reachable from the build environment. The subsequent deploy came up clean.
+
+## Deep bug-hunt audit — medium severity (PR #29)
+
+**Date:** 2026-08-21
+
+**Status:** Complete, merged. Follow-up to PR #27/#28, same discipline, all 14 medium-severity findings — this closed out the full 29-finding audit (3 critical + 12 high + 14 medium).
+
+**Correctness (#16, #19, #21, #24, #26):**
+- `stateMachine.ts`'s `isExpectedTransition` no longer throws a `TypeError` on a status Stripe sends that isn't in `EXPECTED_TRANSITIONS` — an unrecognized transition is now just "not expected" instead of crashing `recordTransition`'s transaction and permanently parking the subscription's webhooks as `failed`.
+- `computeMrrMinor` now excludes tiered/graduated/package-priced items (Stripe's `price.unit_amount` is `null` for those) from the MRR sum instead of coercing them to 0 and silently understating revenue; `projectSubscription` stores a sentinel (`-1`) for those items' `unit_amount_minor` and logs a warning, the list endpoint surfaces a `has_tiered_pricing` flag, and the admin UI shows a "tiered pricing excluded" note.
+- `GET /subscriptions`'s pagination cursor is now an opaque base64url-encoded `(created_at, id)` pair with a native Postgres row-value comparison as the tiebreaker, instead of a bare `created_at` timestamp — two subscriptions created in the same millisecond could previously be skipped or duplicated across a page boundary.
+- Subscription items are now fetched via their own separately-paginated `stripe.subscriptionItems.list()` call instead of `subscription.items.data`, which Stripe caps well short of what an actual subscription can carry.
+- Reconciliation's window upper bound is now clamped to 2 minutes behind wall-clock "now" before Stripe's list-invoices pagination begins, since Stripe's List Invoices has no ascending-order option — newest-first pagination racing a live write could otherwise never see an invoice created mid-walk.
+
+**Robustness (#17, #20, #22, #23, #28):** `lib/validate.ts`'s `parseUuidParam` replaces every route's inline `req.params` cast with real UUID validation (400 instead of a raw Postgres error); `app.ts` gained a global error handler mapping any unexpected 500+ error to a generic message; `RECONCILE_TZ` now validates as a real IANA time zone at boot; a webhook event's own bookkeeping UPDATE (parking it failed, or requeuing with backoff) is now wrapped in its own try/catch separate from the dispatch it's recording the outcome of; `reconcile-nightly.ts`'s per-currency loop now isolates each currency's run in its own try/catch and exits non-zero if any failed; migrations now run through a dedicated single-connection `Pool` with `lock_timeout`/`statement_timeout` GUCs guaranteed to apply to the connection `migrate()` actually uses.
+
+**Data integrity (#18, #21):** see D-034 in `docs/DECISIONS.md` for the `invoices.created_at` reconciliation-windowing fix (superseding D-025) and the companion `stripe_subscription_id` column that powers orphaned-invoice re-linking on first-time subscription creation, replayed through the dunning engine using the invoice's own now-authoritative status as a proxy for the event type that originally would have dispatched it. Both new columns share the same disclosed, self-healing (not backfilled) gap for pre-existing rows.
+
+**Abuse prevention (#27):** `POST /checkout/sessions` and `POST /portal/sessions` now rate-limit at 10 requests/minute, keyed by IP and `customer_id` together — see `docs/ARCHITECTURE.md`'s closing section for the full reasoning and its relationship to the still-open outbound-idempotency double-submit gap from Phase 8.
+
+**Files touched:** `billing/stateMachine.ts`, `lib/validate.ts`, `app.ts`, `routes/subscriptions.ts`, `routes/dunning.ts`, `routes/reconciliation.ts`, `billing/reconcile.ts`, `stripe/sync.ts`, `webhooks/handlers/invoice.ts`, `lib/envSchema.ts`, `webhooks/processor.ts`, `scripts/reconcile-nightly.ts`, `scripts/test-clock-demo.ts`, `db/migrate.ts`, `db/schema.ts` (two new `invoices` columns + two migrations), `lib/rateLimit.ts` (new), `routes/checkout.ts`, `routes/portal.ts`, `web/src/lib/types.ts`, `web/src/pages/SubscriptionsListPage.tsx`, plus new/updated tests across the same surfaces including a dedicated `rateLimit.test.ts`.
+
+**Verification:** typecheck, lint, both workspace builds, full suite green: 112 unit + 179 integration + 34 web tests — 325 total, up from 254 before this three-PR audit arc.
+
+**Open items:** none from the audit itself — all 29 findings across all three severities are now fixed, tested, and merged. The two disclosed, accepted gaps (M22's untested bookkeeping-failure sub-case; the non-backfilled `invoices.created_at`/`stripe_subscription_id` columns, see D-034) remain exactly as disclosed in each PR, not silently dropped. The Phase 9 live-deployed-demo-seeding open item is unrelated to this audit and remains open, unchanged.
