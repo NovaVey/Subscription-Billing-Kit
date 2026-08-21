@@ -1,11 +1,11 @@
 import { stripe } from './client.js';
-import { portalSessionKey } from './idempotency.js';
+import { portalSessionKey, type IdempotencyContext } from './idempotency.js';
 import { env } from '../env.js';
 
 export interface CreatePortalSessionInput {
   stripeCustomerId: string;
   returnUrl: string;
-  requestedAt: Date;
+  idempotency: IdempotencyContext;
 }
 
 export async function createPortalSession(input: CreatePortalSessionInput): Promise<{ url: string }> {
@@ -15,7 +15,7 @@ export async function createPortalSession(input: CreatePortalSessionInput): Prom
       return_url: input.returnUrl,
       ...(env.STRIPE_PORTAL_CONFIG_ID ? { configuration: env.STRIPE_PORTAL_CONFIG_ID } : {}),
     },
-    { idempotencyKey: portalSessionKey(input.stripeCustomerId, input.requestedAt) },
+    { idempotencyKey: portalSessionKey(input.stripeCustomerId, input.idempotency) },
   );
 
   return { url: session.url };

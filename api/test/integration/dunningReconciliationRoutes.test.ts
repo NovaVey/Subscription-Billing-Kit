@@ -205,6 +205,48 @@ describe('POST /dunning/:id/resolve', () => {
     });
     expect(response.statusCode).toBe(400);
   });
+
+  it('lets exactly one of two concurrent resolve requests for the same cycle succeed (finding #7, deep bug hunt)', async () => {
+    // A double-submitted click, or two operators resolving the same
+    // subscription at once - a plain SELECT-then-UPDATE would let both
+    // requests pass the "not already resolved" check before either writes,
+    // both commit, and the second silently discards the first's outcome
+    // (and doubles the audit trail). The guarded UPDATE must let only the
+    // first commit succeed.
+    const customerId = await seedCustomer('double-submit@example.com');
+    const subscriptionId = await seedSubscription(customerId);
+    await db.insert(dunningState).values({ subscriptionId, stage: 1, noticesSent: 0 });
+
+    const [responseA, responseB] = await Promise.all([
+      app.inject({
+        headers: WRITE_KEY_HEADERS,
+        method: 'POST',
+        url: `/dunning/${subscriptionId}/resolve`,
+        payload: { resolution: 'recovered', note: 'operator A' },
+      }),
+      app.inject({
+        headers: WRITE_KEY_HEADERS,
+        method: 'POST',
+        url: `/dunning/${subscriptionId}/resolve`,
+        payload: { resolution: 'manual', note: 'operator B' },
+      }),
+    ]);
+
+    const statuses = [responseA.statusCode, responseB.statusCode].sort();
+    expect(statuses).toEqual([200, 409]);
+
+    const [dunningRow] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, subscriptionId));
+    expect(dunningRow?.resolvedAt).not.toBeNull();
+    expect(dunningRow?.stage).toBe(0);
+
+    // Exactly one manual audit row was written - the loser never reached
+    // the subscription_events insert inside its transaction.
+    const events = await db
+      .select()
+      .from(subscriptionEvents)
+      .where(eq(subscriptionEvents.subscriptionId, subscriptionId));
+    expect(events.filter((e) => e.reason === 'manual:api')).toHaveLength(1);
+  });
 });
 
 describe('GET /admin/reconciliation', () => {

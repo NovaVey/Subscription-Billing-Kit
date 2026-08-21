@@ -117,10 +117,25 @@ export async function handleInvoiceEvent(event: Stripe.Event): Promise<HandlerRe
   // leave a paid invoice recorded locally with its dunning cycle still
   // open, or vice versa.
   await db.transaction(async (tx) => {
+    // Re-read (and lock) inside the transaction rather than trust the
+    // pre-transaction `existing` read above (which only fed the
+    // staleGuard/draft-delete checks) - see stripe/sync.ts's
+    // syncSubscriptionFromStripe for why a concurrent sync of the same
+    // invoice needs this guard, not just staleGuard's own non-atomic read.
+    const [current] = await tx
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeInvoiceId, stripeInvoiceId))
+      .for('update');
+
+    if (current?.lastEventAt && current.lastEventAt.getTime() > eventCreatedAt.getTime()) {
+      return;
+    }
+
     let localInvoiceId: string;
-    if (existing) {
-      await tx.update(invoices).set(row).where(eq(invoices.id, existing.id));
-      localInvoiceId = existing.id;
+    if (current) {
+      await tx.update(invoices).set(row).where(eq(invoices.id, current.id));
+      localInvoiceId = current.id;
     } else {
       const [inserted] = await tx.insert(invoices).values(row).returning({ id: invoices.id });
       localInvoiceId = inserted!.id;

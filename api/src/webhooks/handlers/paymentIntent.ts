@@ -46,14 +46,21 @@ export async function handlePaymentIntentEvent(event: Stripe.Event): Promise<Han
     return {};
   }
 
-  await db.insert(paymentAttempts).values({
-    invoiceId: invoiceRow.id,
-    stripePaymentIntentId: paymentIntent.id,
-    status: 'failed',
-    failureCode: paymentIntent.last_payment_error?.code ?? null,
-    failureMessage: paymentIntent.last_payment_error?.message ?? null,
-    amountMinor: paymentIntent.amount,
-  });
+  // Idempotent by stripe_payment_intent_id (unique in the schema) - any
+  // re-invocation of this handler for the same payment intent (a retry
+  // after a transient finalize failure, a reaped lease, an admin replay)
+  // is a no-op rather than a duplicate audit row. See the deep bug hunt.
+  await db
+    .insert(paymentAttempts)
+    .values({
+      invoiceId: invoiceRow.id,
+      stripePaymentIntentId: paymentIntent.id,
+      status: 'failed',
+      failureCode: paymentIntent.last_payment_error?.code ?? null,
+      failureMessage: paymentIntent.last_payment_error?.message ?? null,
+      amountMinor: paymentIntent.amount,
+    })
+    .onConflictDoNothing({ target: paymentAttempts.stripePaymentIntentId });
 
   return {};
 }

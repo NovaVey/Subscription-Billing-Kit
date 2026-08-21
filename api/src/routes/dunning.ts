@@ -71,20 +71,22 @@ export async function dunningRoutes(app: FastifyInstance) {
     const subRow = await loadSubscriptionOr404(id, reply);
     if (!subRow) return;
 
-    const [existing] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, id));
-    if (!existing) {
-      return reply.code(404).send({ error: 'no dunning cycle for this subscription' });
-    }
-    if (existing.resolvedAt) {
-      return reply.code(409).send({ error: 'dunning cycle is already resolved' });
-    }
-
     const now = new Date();
-    await db.transaction(async (tx) => {
-      await tx
+    // The not-already-resolved check lives in the UPDATE's own WHERE
+    // clause, not a pre-transaction SELECT - two concurrent resolve
+    // requests for the same subscription (a double-submitted click, two
+    // operators acting at once) would otherwise both pass a plain SELECT
+    // check before either writes, both commit, and the second would
+    // silently discard the first's outcome. Folded into the guarded
+    // UPDATE, only the first to commit succeeds; the second sees zero rows
+    // affected. See the deep bug hunt.
+    const resolved = await db.transaction(async (tx) => {
+      const [updated] = await tx
         .update(dunningState)
         .set({ resolvedAt: now, resolution, stage: 0, nextActionAt: null })
-        .where(eq(dunningState.subscriptionId, id));
+        .where(and(eq(dunningState.subscriptionId, id), isNull(dunningState.resolvedAt)))
+        .returning({ subscriptionId: dunningState.subscriptionId });
+      if (!updated) return false;
 
       await tx.insert(subscriptionEvents).values({
         subscriptionId: id,
@@ -94,7 +96,19 @@ export async function dunningRoutes(app: FastifyInstance) {
         actor: 'api',
         note: `dunning resolved (${resolution}): ${note}`,
       });
+      return true;
     });
+
+    if (!resolved) {
+      const [existing] = await db
+        .select({ resolvedAt: dunningState.resolvedAt })
+        .from(dunningState)
+        .where(eq(dunningState.subscriptionId, id));
+      if (!existing) {
+        return reply.code(404).send({ error: 'no dunning cycle for this subscription' });
+      }
+      return reply.code(409).send({ error: 'dunning cycle is already resolved' });
+    }
 
     return reply.send({ subscriptionId: id, resolution });
   });

@@ -220,7 +220,7 @@ describe('a retried create call with the same idempotency key creates one subscr
         stripeCustomerId: stripeCustomer.id,
         priceId: 'price_starter_monthly',
         quantity: 1,
-        requestedAt,
+        idempotency: { requestedAt },
       }),
     ).rejects.toThrow('ETIMEDOUT');
 
@@ -232,7 +232,7 @@ describe('a retried create call with the same idempotency key creates one subscr
       stripeCustomerId: stripeCustomer.id,
       priceId: 'price_starter_monthly',
       quantity: 1,
-      requestedAt, // same requestedAt as the failed attempt - our own retry, not a fresh HTTP request
+      idempotency: { requestedAt }, // same requestedAt as the failed attempt - our own retry, not a fresh HTTP request
     });
     expect(result.url).toBe('https://checkout.stripe.com/cs_retry_test');
 

@@ -48,6 +48,35 @@ describe('EnvSchema', () => {
     if (result.success) expect(result.data.DUNNING_ENABLED).toBe(true);
   });
 
+  it.each(['true', 'True', 'TRUE', '1', 'yes', 'YES', 'on'])(
+    'accepts DUNNING_ENABLED=%s as true',
+    (value) => {
+      const result = EnvSchema.safeParse({ ...validEnv, DUNNING_ENABLED: value });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.DUNNING_ENABLED).toBe(true);
+    },
+  );
+
+  it.each(['false', 'False', 'FALSE', '0', 'no', 'NO', 'off'])(
+    'accepts DUNNING_ENABLED=%s as false',
+    (value) => {
+      const result = EnvSchema.safeParse({ ...validEnv, DUNNING_ENABLED: value });
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.DUNNING_ENABLED).toBe(false);
+    },
+  );
+
+  it.each(['enabled', 'nope', 'True1', ' ', 'null'])(
+    'rejects an unrecognized DUNNING_ENABLED=%s at boot instead of silently defaulting to false',
+    (value) => {
+      const result = EnvSchema.safeParse({ ...validEnv, DUNNING_ENABLED: value });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.map((i) => i.path.join('.'))).toContain('DUNNING_ENABLED');
+      }
+    },
+  );
+
   it('defaults WEBHOOK_LEASE_SECONDS to 300 and RECONCILE_TZ to UTC', () => {
     const result = EnvSchema.safeParse(validEnv);
     expect(result.success).toBe(true);

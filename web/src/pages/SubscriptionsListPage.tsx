@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { listSubscriptions } from '../lib/api';
 import type { SubscriptionListRow } from '../lib/types';
@@ -32,6 +32,12 @@ export function SubscriptionsListPage() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  // Always holds the filters actually in effect right now (updated every
+  // render, not just when a fetch fires) - loadMore() reads it back inside
+  // its own .then() to tell "the filters that were active when this page
+  // request went out" from "the filters active now". See loadMore below.
+  const activeFiltersRef = useRef({ status, appliedQ });
+  activeFiltersRef.current = { status, appliedQ };
 
   // loadMore appends to `rows` rather than replacing it, which doesn't fit
   // useAsyncData's replace-on-fetch shape - so the initial (filter-driven)
@@ -47,10 +53,21 @@ export function SubscriptionsListPage() {
 
   function loadMore() {
     if (!cursor) return;
+    const requestStatus = status;
+    const requestAppliedQ = appliedQ;
     setLoadingMore(true);
     setLoadMoreError(null);
-    listSubscriptions({ status: status || undefined, q: appliedQ || undefined, cursor, limit: 25 })
+    listSubscriptions({ status: requestStatus || undefined, q: requestAppliedQ || undefined, cursor, limit: 25 })
       .then((res) => {
+        // The status/search filter can change while this page request is
+        // still in flight - the base useAsyncData fetch for the new filter
+        // already replaced `rows` by the time this resolves. Appending a
+        // stale filter's page onto the new filter's rows would silently mix
+        // the two result sets together, so discard it once the filters
+        // active now no longer match the ones this request was made under.
+        // See the deep bug hunt.
+        const current = activeFiltersRef.current;
+        if (current.status !== requestStatus || current.appliedQ !== requestAppliedQ) return;
         setRows((prev) => [...prev, ...res.subscriptions]);
         setCursor(res.nextCursor);
       })

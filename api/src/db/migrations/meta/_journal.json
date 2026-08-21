@@ -15,6 +15,13 @@
       "when": 1787264831857,
       "tag": "0001_slippery_amphibian",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787347977176,
+      "tag": "0002_wise_roulette",
+      "breakpoints": true
     }
   ]
 }

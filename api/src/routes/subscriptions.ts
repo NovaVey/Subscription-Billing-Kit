@@ -3,7 +3,12 @@ import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 import { z } from 'zod';
 import { stripe } from '../stripe/client.js';
-import { subscriptionCancelKey, subscriptionPlanChangeKey, subscriptionResumeKey } from '../stripe/idempotency.js';
+import {
+  clientIdempotencyToken,
+  subscriptionCancelKey,
+  subscriptionPlanChangeKey,
+  subscriptionResumeKey,
+} from '../stripe/idempotency.js';
 import { syncSubscriptionFromStripe } from '../stripe/sync.js';
 import { db } from '../db/client.js';
 import { customers, dunningState, invoices, subscriptionEvents, subscriptionItems, subscriptions } from '../db/schema.js';
@@ -258,14 +263,14 @@ export async function subscriptionRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'subscription has no active item to change' });
     }
 
-    const requestedAt = new Date();
+    const idempotency = { clientToken: clientIdempotencyToken(req), requestedAt: new Date() };
     await stripe.subscriptions.update(
       subRow.stripeSubscriptionId,
       {
         items: [{ id: itemRow.stripeItemId, price: price_id, quantity }],
         proration_behavior,
       },
-      { idempotencyKey: subscriptionPlanChangeKey(id, price_id, requestedAt) },
+      { idempotencyKey: subscriptionPlanChangeKey(id, price_id, idempotency) },
     );
 
     const result = await resyncAfterMutation(subRow.stripeSubscriptionId, {
@@ -286,8 +291,8 @@ export async function subscriptionRoutes(app: FastifyInstance) {
     const subRow = await loadSubscriptionOr404(id, reply);
     if (!subRow) return;
 
-    const requestedAt = new Date();
-    const idempotencyKey = subscriptionCancelKey(id, at_period_end, requestedAt);
+    const idempotency = { clientToken: clientIdempotencyToken(req), requestedAt: new Date() };
+    const idempotencyKey = subscriptionCancelKey(id, at_period_end, idempotency);
 
     if (at_period_end) {
       await stripe.subscriptions.update(
@@ -314,8 +319,8 @@ export async function subscriptionRoutes(app: FastifyInstance) {
     const subRow = await loadSubscriptionOr404(id, reply);
     if (!subRow) return;
 
-    const requestedAt = new Date();
-    const idempotencyKey = subscriptionResumeKey(id, requestedAt);
+    const idempotency = { clientToken: clientIdempotencyToken(req), requestedAt: new Date() };
+    const idempotencyKey = subscriptionResumeKey(id, idempotency);
 
     if (subRow.status === 'paused') {
       await stripe.subscriptions.resume(subRow.stripeSubscriptionId, {}, { idempotencyKey });

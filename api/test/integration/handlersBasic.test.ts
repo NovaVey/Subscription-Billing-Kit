@@ -17,7 +17,7 @@ vi.mock('../../src/stripe/client.js', () => ({
 }));
 
 const { db, pool } = await import('../../src/db/client.js');
-const { customers, dunningState, invoices, paymentAttempts, subscriptions } = await import(
+const { customers, dunningNotices, dunningState, invoices, paymentAttempts, subscriptions } = await import(
   '../../src/db/schema.js'
 );
 const { handleCustomerEvent } = await import('../../src/webhooks/handlers/customer.js');
@@ -300,6 +300,105 @@ describe('invoice handler cleans up a deleted draft invoice on a Stripe 404', ()
   });
 });
 
+describe('invoice handler serializes two genuinely concurrent events for the same invoice (finding #5, deep bug hunt)', () => {
+  it('never leaves dunning open when a late payment_failed races a newer paid event, regardless of which transaction the DB runs first', async () => {
+    const customer = fakeCustomer();
+    await db.insert(customers).values({ stripeCustomerId: customer.id, email: customer.email });
+    const [customerRow] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.stripeCustomerId, customer.id));
+    cleanupCustomerIds.push(customerRow!.id);
+
+    const subscription = fakeSubscription({ customer: customer.id });
+    const [subRow] = await db
+      .insert(subscriptions)
+      .values({
+        customerId: customerRow!.id,
+        stripeSubscriptionId: subscription.id,
+        status: 'active',
+        planCode: 'starter',
+        currency: 'usd',
+      })
+      .returning({ id: subscriptions.id });
+    cleanupSubscriptionIds.push(subRow!.id);
+
+    const t0 = Math.floor(Date.now() / 1000) - 300;
+    const t1 = t0 + 50; // the late payment_failed
+    const t2 = t1 + 50; // the actually-newer paid event
+
+    const invoice = fakeInvoice({
+      customer: customer.id,
+      status: 'open',
+      parent: {
+        type: 'subscription_details',
+        subscription_details: { subscription: subscription.id, metadata: null },
+        quote_details: null,
+      },
+    });
+    // Seed the row first (an already-committed invoice.created) so the
+    // race below exercises the in-transaction FOR UPDATE guard against an
+    // EXISTING row - the realistic scenario, not a first-ever insert race
+    // (see subscriptionProjection.test.ts's equivalent sync.ts test for why
+    // that's a different, narrower case).
+    const [seededRow] = await db
+      .insert(invoices)
+      .values({
+        customerId: customerRow!.id,
+        subscriptionId: subRow!.id,
+        stripeInvoiceId: invoice.id,
+        status: 'open',
+        currency: 'usd',
+        amountDueMinor: invoice.amount_due,
+        lastEventAt: new Date(t0 * 1000),
+      })
+      .returning({ id: invoices.id });
+    cleanupInvoiceIds.push(seededRow!.id);
+
+    // Both concurrent handler calls re-fetch and see the SAME (paid)
+    // Stripe truth - re-fetch-not-trust-the-payload (§5.6) means Stripe
+    // always returns its current state regardless of which locally-stale
+    // event triggered the re-fetch. The only thing that actually differs
+    // between the two calls is event.type and event.created.
+    const paidInvoice = {
+      ...invoice,
+      status: 'paid',
+      amount_paid: invoice.amount_due,
+      status_transitions: { finalized_at: invoice.created, paid_at: t2 },
+    };
+    mockInvoicesRetrieve.mockResolvedValue(paidInvoice);
+
+    await Promise.all([
+      handleInvoiceEvent(fakeEvent('invoice.payment_failed', invoice, { created: t1 }) as never),
+      handleInvoiceEvent(fakeEvent('invoice.paid', paidInvoice, { created: t2 }) as never),
+    ]);
+
+    const [invoiceRowAfter] = await db.select().from(invoices).where(eq(invoices.id, seededRow!.id));
+    expect(invoiceRowAfter?.status).toBe('paid');
+    expect(invoiceRowAfter?.lastEventAt?.getTime()).toBe(t2 * 1000);
+
+    // No matter which transaction the DB happened to run first, the cycle
+    // must never be left open - either the late failed event lost the
+    // guard outright (never opened a cycle), or it opened one moments
+    // before the newer paid event's resolveDunningOnInvoicePaid closed it
+    // again.
+    const [dunningRow] = await db.select().from(dunningState).where(eq(dunningState.subscriptionId, subRow!.id));
+    expect(dunningRow === undefined || dunningRow.resolvedAt !== null).toBe(true);
+
+    // dunning_state.triggering_invoice_id FKs to invoices, and
+    // dunning_notices FKs to subscriptions - if the race above opened a
+    // (now-resolved) cycle, both must be cleared here rather than left for
+    // afterAll, which (unlike dunning.test.ts's) doesn't clean up either
+    // table and would otherwise fail this file's own cleanupInvoiceIds /
+    // cleanupSubscriptionIds deletes with a FK violation. See the deep bug
+    // hunt notes on test-isolation hazards from this same audit.
+    if (dunningRow) {
+      await db.delete(dunningNotices).where(eq(dunningNotices.subscriptionId, subRow!.id));
+      await db.delete(dunningState).where(eq(dunningState.subscriptionId, subRow!.id));
+    }
+  });
+});
+
 describe('payment intent handler resolves the invoice via invoicePayments (PaymentIntent has no .invoice field)', () => {
   it('records a payment_attempts row when the payment intent is linked to a known local invoice', async () => {
     const customer = fakeCustomer();
@@ -354,6 +453,51 @@ describe('payment intent handler resolves the invoice via invoicePayments (Payme
       .from(paymentAttempts)
       .where(eq(paymentAttempts.stripePaymentIntentId, paymentIntent.id));
     expect(attempts).toHaveLength(0);
+  });
+});
+
+describe('payment intent handler is idempotent by stripe_payment_intent_id (finding #4, deep bug hunt)', () => {
+  it('records exactly one payment_attempts row when the same payment intent is handled twice concurrently', async () => {
+    const customer = fakeCustomer();
+    await db.insert(customers).values({ stripeCustomerId: customer.id, email: customer.email });
+    const [customerRow] = await db
+      .select()
+      .from(customers)
+      .where(eq(customers.stripeCustomerId, customer.id));
+    cleanupCustomerIds.push(customerRow!.id);
+
+    const invoice = fakeInvoice({ customer: customer.id });
+    const [invoiceRow] = await db
+      .insert(invoices)
+      .values({
+        customerId: customerRow!.id,
+        stripeInvoiceId: invoice.id,
+        status: 'open',
+        currency: 'usd',
+        amountDueMinor: invoice.amount_due,
+      })
+      .returning({ id: invoices.id });
+    cleanupInvoiceIds.push(invoiceRow!.id);
+
+    const paymentIntent = fakePaymentIntent();
+    mockPaymentIntentsRetrieve.mockResolvedValue(paymentIntent);
+    mockInvoicePaymentsList.mockResolvedValue({ data: [{ invoice: invoice.id }] });
+
+    // Two genuinely concurrent invocations for the same payment intent - a
+    // retry racing the original delivery, or two workers both processing a
+    // reaped lease. Before the unique constraint + onConflictDoNothing,
+    // both inserts could land (a plain SELECT-then-INSERT check has a
+    // window between the two statements); now only one row can ever exist.
+    await Promise.all([
+      handlePaymentIntentEvent(fakeEvent('payment_intent.payment_failed', paymentIntent) as never),
+      handlePaymentIntentEvent(fakeEvent('payment_intent.payment_failed', paymentIntent) as never),
+    ]);
+
+    const attempts = await db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.stripePaymentIntentId, paymentIntent.id));
+    expect(attempts).toHaveLength(1);
   });
 });
 

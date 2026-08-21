@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { createCheckoutSession } from '../stripe/checkout.js';
+import { clientIdempotencyToken } from '../stripe/idempotency.js';
 import { loadCustomerOr404 } from '../lib/lookups.js';
 import { parseOrReply } from '../lib/validate.js';
 
@@ -23,7 +24,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
       stripeCustomerId: customerRow.stripeCustomerId,
       priceId: price_id,
       quantity,
-      requestedAt: new Date(),
+      idempotency: { clientToken: clientIdempotencyToken(req), requestedAt: new Date() },
     });
 
     return reply.code(200).send({ url });
