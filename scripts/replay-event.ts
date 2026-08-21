@@ -16,9 +16,16 @@ async function main() {
     return;
   }
 
-  const ok = await resetWebhookEventForReplay(stripeEventId);
-  if (!ok) {
+  const result = await resetWebhookEventForReplay(stripeEventId);
+  if (result === 'not_found') {
     console.error(`[replay-event] no webhook_events row for ${stripeEventId}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (result === 'processing') {
+    console.error(
+      `[replay-event] ${stripeEventId} is currently processing - refusing to replay a live event; wait for it to finish or be reaped first`,
+    );
     process.exitCode = 1;
     return;
   }

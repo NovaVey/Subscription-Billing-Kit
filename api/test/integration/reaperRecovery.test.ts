@@ -129,4 +129,108 @@ describe('a worker killed mid-event has its row reaped and reprocessed', () => {
     expect(row?.status).toBe('failed');
     expect(row?.attempts).toBe(MAX_ATTEMPTS);
   });
+
+  it('does not double-reap the same row across two immediate ticks', async () => {
+    const event = fakeEvent('customer.subscription.updated', fakeSubscription());
+    cleanupEventIds.push(event.id);
+
+    await db.insert(webhookEvents).values({
+      stripeEventId: event.id,
+      type: event.type,
+      apiVersion: event.api_version,
+      eventCreatedAt: new Date(event.created * 1000),
+      payload: event,
+      status: 'processing',
+      processingStartedAt: staleProcessingStartedAt(),
+      attempts: 0,
+    });
+
+    const first = await reapStaleProcessingEvents();
+    expect(first.reaped).toBeGreaterThanOrEqual(1);
+
+    // The reaper runs on its own interval, independent of the processor -
+    // a second tick firing immediately after the first must not match this
+    // row again (it's 'received' now, not 'processing') and must not
+    // increment its attempts a second time for the same lease expiry.
+    await reapStaleProcessingEvents();
+
+    const [row] = await db.select().from(webhookEvents).where(eq(webhookEvents.stripeEventId, event.id));
+    expect(row?.status).toBe('received');
+    expect(row?.attempts).toBe(1);
+
+    // Left in 'received', this row would otherwise sit around and get
+    // swept up by any later test's processPendingWebhookEvents() call in
+    // this file (afterAll doesn't run until the whole file is done) -
+    // clean it up now rather than risk contaminating a sibling test's own
+    // claim batch.
+    await db.delete(webhookEvents).where(eq(webhookEvents.stripeEventId, event.id));
+  });
+});
+
+describe('a still-alive handler whose lease is reclaimed mid-flight cannot clobber the row that reclaimed it', () => {
+  it('does not finalize to "processed" once the row it claimed has moved on underneath it', async () => {
+    const c = fakeCustomer();
+    await db.insert(customers).values({ stripeCustomerId: c.id, email: c.email });
+    cleanupCustomerIds.push(
+      (await db.select().from(customers).where(eq(customers.stripeCustomerId, c.id)))[0]!.id,
+    );
+
+    const subscription = fakeSubscription({ customer: c.id });
+    const event = fakeEvent('customer.subscription.created', subscription);
+    cleanupEventIds.push(event.id);
+
+    await db.insert(webhookEvents).values({
+      stripeEventId: event.id,
+      type: event.type,
+      apiVersion: event.api_version,
+      eventCreatedAt: new Date(event.created * 1000),
+      payload: event,
+      status: 'received',
+    });
+
+    // The handler's own Stripe call is where the deep bug hunt's exact
+    // scenario lands: the row outlives its lease while still genuinely
+    // in flight. Simulate the reaper reclaiming it (a real requeue, not a
+    // mock) from *inside* the mocked call, i.e. strictly between
+    // claimBatch's claim and processRow's later finalize write.
+    mockRetrieve.mockImplementationOnce(async () => {
+      await db
+        .update(webhookEvents)
+        .set({ status: 'received', processingStartedAt: null, attempts: 1, lastError: 'reaped mid-flight (test)' })
+        .where(eq(webhookEvents.stripeEventId, event.id));
+      return subscription;
+    });
+
+    await processPendingWebhookEvents();
+
+    const [row] = await db
+      .select()
+      .from(webhookEvents)
+      .where(eq(webhookEvents.stripeEventId, event.id));
+    // If processRow's finalize write weren't guarded, this would be
+    // 'processed' - silently overwriting the reap that happened while the
+    // handler (which had already committed its real subscription-projection
+    // side effects, below) was still running.
+    expect(row?.status).toBe('received');
+    expect(row?.attempts).toBe(1);
+    expect(row?.lastError).toBe('reaped mid-flight (test)');
+
+    // The handler's actual work still committed - this guard protects the
+    // webhook_events ledger row, not the handler's own side effects (that's
+    // a separate idempotency concern, see the deep bug hunt's finding on
+    // payment_attempts).
+    const [subRow] = await db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, subscription.id));
+    expect(subRow).toBeDefined();
+    cleanupSubscriptionIds.push(subRow!.id);
+    // Unlike the 'does not double-reap' test above, this row can't be
+    // deleted inline here - a real subscription_events row now references
+    // it via FK (written by the handler this test actually exercised), and
+    // that only gets cleaned up in the right order by afterAll below, keyed
+    // off cleanupSubscriptionIds. Safe to leave 'received' either way: this
+    // is the last test in the file, so there's no later claim batch left to
+    // sweep it up.
+  });
 });

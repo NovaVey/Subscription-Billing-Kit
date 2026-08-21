@@ -1,10 +1,9 @@
 import { env } from './env.js';
 import { buildApp } from './app.js';
 import { startWebhookWorker } from './webhooks/worker.js';
+import { resolveListenTarget } from './lib/listenTarget.js';
 
-const listenUrl = new URL(env.API_BASE_URL);
-const port = listenUrl.port ? Number(listenUrl.port) : 3000;
-const host = listenUrl.hostname === 'localhost' ? '0.0.0.0' : listenUrl.hostname;
+const { port, host } = resolveListenTarget(env.API_BASE_URL);
 
 const app = buildApp();
 

@@ -477,4 +477,23 @@ describe('POST /admin/webhook-events/:id/replay', () => {
     });
     expect(response.statusCode).toBe(404);
   });
+
+  it('refuses to replay a row that is currently processing, rather than racing the live handler working it', async () => {
+    const stripeEventId = await seedWebhookEvent({
+      status: 'processing',
+      processingStartedAt: new Date(),
+    });
+
+    const response = await app.inject({
+      headers: WRITE_KEY_HEADERS,
+      method: 'POST',
+      url: `/admin/webhook-events/${stripeEventId}/replay`,
+    });
+    expect(response.statusCode).toBe(409);
+
+    // The row must be left exactly as it was - not reset out from under
+    // whatever is actively working it.
+    const [row] = await db.select().from(webhookEvents).where(eq(webhookEvents.stripeEventId, stripeEventId));
+    expect(row?.status).toBe('processing');
+  });
 });

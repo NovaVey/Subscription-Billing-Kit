@@ -81,6 +81,20 @@ export async function openDunningCycleOnPaymentFailed(
     return;
   }
 
+  // A cycle resolved as 'canceled' was closed by
+  // closeDunningOnSubscriptionDeleted on customer.subscription.deleted -
+  // Stripe subscriptions are immutable once canceled, so nothing ever
+  // un-deletes this same subscriptionId. Webhook delivery order isn't
+  // guaranteed though: Stripe can generate a final invoice right around
+  // cancellation, and its invoice.payment_failed can arrive AFTER the
+  // deletion event. Without this check, that late/out-of-order event would
+  // reopen and re-arm a dunning cycle - emailing the customer "your payment
+  // failed" for a subscription Stripe already reports deleted. See the deep
+  // bug hunt.
+  if (existing?.resolution === 'canceled') {
+    return;
+  }
+
   const nextActionAt = nextActionAtForStage(1, input.now);
   if (existing) {
     await tx

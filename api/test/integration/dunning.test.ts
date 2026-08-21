@@ -413,6 +413,51 @@ describe('re-opening-a-resolved-cycle-clears-stale-notices-from-the-prior-cycle'
   });
 });
 
+describe('a-canceled-cycle-is-never-reopened-by-a-late-out-of-order-payment-failed', () => {
+  it('leaves a resolution=canceled cycle untouched when invoice.payment_failed arrives after customer.subscription.deleted already closed it', async () => {
+    const { subscription, subRow } = await seedCustomerAndSubscription();
+
+    // Already closed as canceled - the exact terminal state
+    // closeDunningOnSubscriptionDeleted leaves behind.
+    await db.insert(dunningState).values({
+      subscriptionId: subRow.id,
+      stage: 4,
+      enteredStageAt: new Date(),
+      nextActionAt: null,
+      resolvedAt: new Date(),
+      resolution: 'canceled',
+    });
+
+    // Stripe can generate a final invoice right around cancellation, and
+    // webhook delivery order isn't guaranteed - its payment_failed can
+    // arrive after the deletion event already processed. Without the guard
+    // this test exercises, that late event would reopen and re-arm a
+    // dunning cycle for a subscription Stripe already reports gone.
+    const lateFailedInvoice = subscriptionLinkedInvoice(subscription.id, subscription.customer, { status: 'open' });
+    mockInvoicesRetrieve.mockResolvedValueOnce(lateFailedInvoice);
+    await handleInvoiceEvent(fakeEvent('invoice.payment_failed', lateFailedInvoice) as never);
+    const [invoiceRow] = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeInvoiceId, lateFailedInvoice.id));
+    cleanupInvoiceIds.push(invoiceRow!.id);
+
+    const state = await getDunningState(subRow.id);
+    expect(state?.stage).toBe(4);
+    expect(state?.resolvedAt).not.toBeNull();
+    expect(state?.resolution).toBe('canceled');
+
+    const notices = await db.select().from(dunningNotices).where(eq(dunningNotices.subscriptionId, subRow.id));
+    expect(notices).toHaveLength(0); // no stage-1 notice was armed for a reopened cycle
+
+    await runDunningTick();
+    const sendCallsForSub = mockEmailSend.mock.calls.filter(
+      ([arg]) => (arg as { subscriptionId: string }).subscriptionId === subRow.id,
+    );
+    expect(sendCallsForSub).toHaveLength(0);
+  });
+});
+
 describe('subscription-deleted-closes-an-open-dunning-cycle-permanently', () => {
   it('closes an open dunning cycle as canceled on customer.subscription.deleted, and a later tick does not re-escalate or re-notify it', async () => {
     const { subscription, subRow } = await seedCustomerAndSubscription();
