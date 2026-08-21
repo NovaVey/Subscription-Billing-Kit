@@ -12,7 +12,7 @@ Operational reference for running this service — local dev, deploying, and the
 | `STRIPE_WEBHOOK_SECRET` | Optional at boot, required at runtime | The app still starts and serves `/health` without it, but every webhook is rejected with a loud 500 until it's set — see the gotcha below. |
 | `STRIPE_PORTAL_CONFIG_ID` | Optional | Only needed if you use a non-default Customer Portal configuration. |
 | `APP_BASE_URL` | Optional (defaults `http://localhost:5173`) | The admin UI's own origin — also what CORS is scoped to (see `docs/DECISIONS.md` D-029). Set it explicitly outside dev. |
-| `API_BASE_URL` | Optional (defaults `http://localhost:3000`) | Where the API itself is reachable. Set it explicitly outside dev. |
+| `API_BASE_URL` | Optional (defaults `http://localhost:3000`) | Where the API itself is reachable. Set it explicitly outside dev. Only its **port** affects the running process (the listener always binds every interface, `0.0.0.0` — never the URL's hostname, which is DNS/proxy-routed on a PaaS and isn't present on any local interface to bind to). |
 | `DUNNING_ENABLED` | Optional (defaults `true`) | Gates the in-process 15-minute dunning tick (dev). Set `false` to disable it without redeploying — e.g. if `scripts/dunning-tick.ts` is scheduled externally instead. |
 | `WEBHOOK_LEASE_SECONDS` | Optional (defaults `300`) | How long a claimed `processing` row can stay claimed before the reaper reclaims it. |
 | `RECONCILE_TZ` | Optional (defaults `UTC`) | The timezone `computeYesterdayWindow()` bounds the nightly reconciliation window in. |

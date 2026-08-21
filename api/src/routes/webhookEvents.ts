@@ -67,9 +67,14 @@ export async function webhookEventRoutes(app: FastifyInstance) {
   app.post('/admin/webhook-events/:id/replay', async (req, reply) => {
     const { id } = req.params as { id: string };
 
-    const ok = await resetWebhookEventForReplay(id);
-    if (!ok) {
+    const result = await resetWebhookEventForReplay(id);
+    if (result === 'not_found') {
       return reply.code(404).send({ error: 'webhook event not found' });
+    }
+    if (result === 'processing') {
+      return reply.code(409).send({
+        error: 'webhook event is currently processing - wait for it to finish or be reaped before replaying it',
+      });
     }
 
     return reply.send({ stripeEventId: id, status: 'received' });
