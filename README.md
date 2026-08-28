@@ -59,6 +59,13 @@ stripe listen --forward-to localhost:3000/webhooks/stripe
 
 Every admin route requires a key (`ADMIN_API_KEY` for full access, `ADMIN_READONLY_KEY` for browse-only) — the admin UI prompts for one on first load. See `docs/DECISIONS.md` D-033.
 
+## Security
+
+Secrets (`STRIPE_SECRET_KEY`, `DATABASE_URL`, `ADMIN_API_KEY`, `ADMIN_READONLY_KEY`, `STRIPE_WEBHOOK_SECRET`) live only in `.env` (gitignored) or your deploy platform's env vars — never in source, a commit, or a chat log. If one is ever exposed outside that vault, treat it as compromised and rotate it immediately, not on a schedule:
+
+- **Stripe key**: Dashboard-only — Developers → API keys → Rotate. There's no programmatic path; Stripe's API deliberately doesn't expose key management. A restricted key needs its non-default permissions (e.g. `Test Clocks Write` for `scripts/test-clock-demo.ts`) re-added on the replacement.
+- **Postgres password**: rotating it is two steps, not one — `ALTER USER ... PASSWORD` on the database itself, *and* a matching `DATABASE_URL` update on every deployed environment. Changing only the platform's env var doesn't touch the running database (Postgres reads that value once, at first `initdb`), so it breaks the connection instead of rotating anything.
+
 ## Testing
 
 ```
