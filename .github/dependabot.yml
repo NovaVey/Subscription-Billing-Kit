@@ -4,6 +4,18 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # vitest and @vitest/coverage-v8 (and any other @vitest/* package)
+      # must stay on the exact same version - @vitest/coverage-v8 peer-
+      # requires the matching vitest version. Splitting a bump across two
+      # separate PRs (as happened with the 4.1.10 -> 4.1.11 patch bump)
+      # leaves neither PR mergeable on its own: whichever one bumps first
+      # fails npm ci with an unsatisfiable peer-dependency conflict. This
+      # groups the whole family into one PR per update instead.
+      vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
